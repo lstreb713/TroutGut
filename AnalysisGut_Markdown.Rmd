@@ -9,7 +9,7 @@ output:
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
-knitr::opts_knit$set(root.dir = "/Users/lisastreb/Library/CloudStorage/OneDrive-HelmholtzZentrumMünchen/CONTACT/Data_Analysis/CONTACT_Gut")
+knitr::opts_knit$set(root.dir = "~/Data_Analysis/CONTACT_Gut")
 
 ```
 
@@ -2579,7 +2579,7 @@ saveRDS(Con_ad_analyze, file= "NetworkAnalzye_control_adult.rds")
 saveRDS(Con_juv_analyze, file= "NetworkAnalzye_control_juv.rds")
 
 ## Identification of influential network hubs
-##script adjusted from PAME :) + based on this vignette: https://cran.r-project.org/web/packages/influential/vignettes/Vignettes.html
+##script based on this vignette: https://cran.r-project.org/web/packages/influential/vignettes/Vignettes.html
 
 library(influential)
 library(readr)
