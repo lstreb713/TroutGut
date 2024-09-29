@@ -1,0 +1,3403 @@
+---
+title: "Trout Gut Microbiome Script"
+author: "Lisa-Marie Streb"
+date: "2024-04-22"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "/Users/lisastreb/Library/CloudStorage/OneDrive-HelmholtzZentrumMünchen/CONTACT/Data_Analysis/CONTACT_Gut")
+
+```
+
+R Script for data analysis of "Age Matters: Explording differential effects of antimicrobial treatment on the gut microbiome of juvenile and adult brown trout (Salmo trutta fario)".
+
+### Setup Working Environment
+
+```{r Renv, echo = TRUE, results='hide', error=FALSE, warning=FALSE, message=FALSE}
+
+#load necessary packages for downstream analysis
+
+library(vegan)
+library(ggplot2)
+library(phyloseq)
+library(dplyr)
+library(ggpubr)
+library(microbiome)
+library(Biostrings)
+library(reshape2)
+library(tidyr)
+library(ggcorrplot)
+library(RColorBrewer)
+library(tidyverse)
+library(NetCoMi)
+library(DESeq2)
+library(openxlsx)
+library(metagenomeSeq)
+library(lme4)
+library(emmeans)
+library(MASS)
+library(effects)
+library(pairwiseAdonis)
+library(ComplexHeatmap)
+library(ggpubr)
+library(ape)
+library(kableExtra)
+library(GGally)
+library(NetCoMi)
+library(influential)
+library(microeco)
+library(igraph)
+
+##show session info
+sessionInfo()
+
+##set theme for plotting
+theme_set(theme_classic(base_size=18))
+```
+
+#### load data and prepare phyloseq object
+
+```{r physeq, echo=TRUE, error=FALSE}
+
+otu <- read.delim2("01_tidy_data/ASVs_abundance_Gut_clean.csv", sep=";", row.names=1) #sets first column as rownames = ASV_IDs
+colnames(otu)
+
+taxa <- read.delim2("01_tidy_data/ASVs_taxonomy_Gut_clean.csv", sep=";", row.names=1)
+colnames(taxa)
+#Note: microbiome functions need the colnames with capital letters + Domain instead of Kingdom
+tax_name <- c("Domain", "Phylum", "Class", "Order", "Family", "Genus", "Species")
+colnames(taxa) <- tax_name
+taxa <- as.matrix(taxa)
+
+metadata <- read.delim2("01_tidy_data/Metadata_Gut.txt")
+rownames(metadata) <- metadata[,1] #assign SampleID as rownames for merging 
+metadata <- as.data.frame(metadata)
+metadata$Age <- sub("1", "Juvenile", metadata$Age)
+metadata$Age <- sub("2", "Adult", metadata$Age)
+metadata$Treatment <- sub("Combination", "Mixture", metadata$Treatment)
+metadata$Treatment <- factor(metadata$Treatment, levels=c("Control", "Florfenicol", "Mixture", "PAA"))
+metadata$Timepoint <- factor(metadata$Timepoint, levels=c("t0", "t10", "t14", "t21", "t28", "t50"))
+sampledata = sample_data(metadata)
+
+#reload RefSeqs
+
+refseq <- Biostrings::readDNAStringSet("01_tidy_data/ASVs_Sequences_clean.fa")
+
+#load phylogenetic tree
+tree <- read.tree("01_tidy_data/ML_tree_Gut.nhx")
+tree <- root(tree, outgroup="ASV19034", resolve.root=TRUE)
+is.rooted(tree)
+
+OTU = otu_table(otu, taxa_are_rows = TRUE)
+TAX = tax_table(taxa)
+ps = phyloseq(OTU, TAX, sampledata, refseq, phy_tree(tree))
+
+ps
+
+#extract sample sums as a df
+
+depth <- as.data.frame(sample_sums(ps))
+
+#removal of sample D149, D147, D142 due to very low read counts < 160 Reads. Note: re-sequencing failed multiple times
+
+ps <- subset_samples(ps, !SampleID %in% c("D142", "D147", "D149"))
+
+#removal of samples that are clear outliers as shown in some exploratory analysis
+#those samples showed very low diversity with a high dominance of ASV1, ASV2 and ASV5 = likely diseased individuals
+prob_samples <- c("D6", "D21", "D123", "D165", "D29", "D46", "D78", "D169", "D204", "D206", "D93", "D184")
+ps_sub <- subset_samples(ps, !SampleID %in% prob_samples)
+
+#remove t50 from the juvenile subset as the main focus of the paper is the direct comparison of adult vs. juvenile fish
+ps_sub <- subset_samples(ps_sub, !Timepoint == "t50")
+ps_sub <- prune_taxa(taxa_sums(ps_sub) > 0, ps_sub)
+
+summarize_phyloseq(ps_sub)
+
+```
+
+The final phyloseq object for the downstream analysis contains 165 samples with 16545 taxa.
+
+#### create color vectors for plots
+
+```{r colors, echo = TRUE, error=FALSE}
+
+#general
+age <- c("Adult" = "#38761D", "Juvenile" = "#96d67a")
+
+treatment <- c("Control" = "#afc9a4", "Florfenicol" = "#972f2f", "Mixture" = "#194775", "PAA" = "#faab2c")
+
+timepoint <- c("t0" = "#339966", "t10" = "#c41e3a", "t14" = "#001e4d", "t21" = "#2f64b7", "t28" = "#a3badf")
+
+age_treat <- c("Control - Adult" = "#8ca083", "Control - Juvenile" = "#afc9a4", 
+               "Florfenicol - Adult" = "#872a2a", "Florfenicol - Juvenile" = "#ab5858",
+               "Mixture - Adult" = "#14385d", "Mixture - Juvenile" = "#466b90",
+               "Peracetic Acid - Adult" = "#ca8923", "Peracetic Acid - Juvenile" = "#faab2c")
+
+# taxa colors for area/bar plots
+
+col_pA <- c("Proteobacteria" = "#89BF71", 
+           "Bacteroidota" = "#95C7F6", 
+           "Firmicutes" = "#C19BD2", 
+           "unclassified" = "#f4a34e", 
+           "Actinobacteriota" = "#5091CB",
+          "Myxococcota" = "#54863f", 
+           "Chloroflexi" = "#8571B8", 
+           "Fusobacteriota" = "#E06A6A", 
+           "Others" = "#906179",
+           "Spirochaetota" = "#a9a9a9"
+           )
+
+col_pJ <- c("Proteobacteria" = "#89BF71", 
+           "Bacteroidota" = "#95C7F6", 
+           "Firmicutes" = "#C19BD2", 
+           "unclassified" = "#f4a34e", 
+           "Actinobacteriota" = "#5091CB",
+          "Myxococcota" = "#54863f", 
+           "Chloroflexi" = "#8571B8", 
+           "Fusobacteriota" = "#E06A6A", 
+           "Others" = "#906179"
+           )
+
+col_fJ <- c("Aeromonadaceae" = "#A6CEE3", "Bacteroidaceae" = "#6FAACF", "Alteromonadaceae" = "#5888a5", "Beijerinckiaceae" = "#C37E37", "Caulobacteraceae" = "#3F8EAA", "Chitinibacteraceae" = "#7BB899", "Chromobacteriaceae" = "#79C360", "Comamonadaceae" = "#669E48", "Erwiniaceae" = "#a3a3a3", "Erysipelotrichaceae" = "#F9908F", "Fusobacteriaceae" = "#E52829", "Microbacteriaceae" = "#EF5C5C", "Moraxellaceae" = "#EA4A34", "Others" = "#F58E56", "Oxalobacteraceae" = "#FDB762", "Porphyromonadaceae" = "#FE9D35", "Pseudomonadaceae" = "#FE8308", "Rhodobacteraceae" = "#ED8F51", "Saprospiraceae" = "#D7A49E", "Shewanellaceae" = "#BBA0CD", "Sphingomonadaceae" = "#9471B4", "Spirosomaceae" = "#6D419C", "Streptococcaceae" = "#A18499", "Veillonellaceae" = "#DDD399", "Vibrionaceae" = "#F0E084", "Weeksellaceae" = "#D09C56", "Xanthomonadaceae" = "#B15928")
+
+col_gJ <- c("Acinetobacter" =  "#A6CEE3", "Aeromonas"="#74AED1" , "Bacteroides" = "#438EC0", "Brevundimonas" = "#2D82AF", "Candidatus Profftella"= "#63A8A0", "Cetobacterium" = "#99CD91", "Chryseobacterium"="#98D277" , "Crenobacter"="#6E9E4C",               "Deefgea"="#B89B74", "Falsiporphyromonas"="#FA9594", "Flavobacterium" = "#F16667", "Fusobacterium" = "#E62F27", "Hydrogenophaga" = "#F06C45", "Lactococcus" = "#F9A963", "Pantoea" = "#FE982C", "Paracoccus" = "#FE8103", "Peptoniphilus" = "#3677B2", "Photobacterium" = "#ED8F47", "Pseudomonas" = "#D9A295", "Pseudorhodobacter" = "#C3AAD2", "Rhodoferax" = "#A07FBC", "Shewanella" = "#7D54A5", "Sphaerotilus" = "#825D99", "Sphingomonas" = "#BC6060", "Sphingorhabdus" = "#B9A499", "Stenotrophomonas" = "#F0EB99", "Streptococcus" = "#EAD27A", "unclassified" = "#CD9551", "Succiniclasticum" = "#BCBCBC", "Sutterella" = "#4b4b4b", "Veillonella" = "#B15928")
+
+col_g <- c("Acinetobacter" =  "#c0dceb", "Aeromonas"="#74AED1" , "Bacteroides" = "#3c7fac", "Brevundimonas" = "#2e6386", "Candidatus Profftella"= "#63A8A0", "Carnobacterium" = "#3b6460", "Cetobacterium" = "#99CD91", "Chryseobacterium"="#b6df9f" , "Crenobacter"="#6E9E4C", "Clostridium sensu stricto 1" = "#275214", "Corynebacterium" = "#BCBCBC","Deefgea"="#B89B74", "Falsiporphyromonas"="#FA9594", "Flavobacterium" = "#F16667", "Fusobacterium" = "#E62F27", "Hydrogenophaga" = "#F06C45", "Lactococcus" = "#F9A963", "Pantoea" = "#cb7923", "Paracoccus" = "#fed5aa", "Photobacterium" = "#ef7819", "Pseudomonas" = "#D9A295", "Pseudorhodobacter" = "#dbcce4", "Rhodoferax" = "#9c88a8", "Shewanella" = "#704b94", "Sphaerotilus" = "#3e2a52", "Sphingomonas" = "#BC6060", "Sphingorhabdus" = "#B9A499", "Stenotrophomonas" = "#F0EB99", "Streptococcus" = "#EAD27A", "unclassified" = "#CD9551",  "Sutterella" = "#4b4b4b", "Veillonella" = "#B15928", "Undibacterium" = "#7b3e1c")
+
+  asv_col <- c("ASV3;Aeromonas" = "#89bf71", "ASV2;Deefgea" = "#7bab65", "ASV19;Photobacterium" = "#6d985a", "ASV225;Hydrogenophaga" = "#5f854f", "ASV116;Stenotrophomonas" = "#527243", "ASV39;Shewanella" = "#445f38", "ASV5;Cetobacterium" = "#c95f5f", "ASV402;Bacteroides" = "#86b3dd", "ASV80;Lactococcus" = "#c19bd2", "ASV17;Lactococcus" = "#ad8bbd", "ASV27;Lactococcus" = "#9a7ca8", "ASV47;Lactococcus" = "#876c93", "ASV58;Lactococcus" = "#735d7e", "ASV90;Streptococcus" = "#604d69", "ASV23;Streptococcus" = "#7f7087", "ASV449;Streptococcus" = "#392e3f")
+
+
+```
+
+### Normalization
+
+```{r Norm, echo=TRUE, error=FALSE, warning=FALSE, results='hide', message=FALSE}
+
+#check for sufficient sampling depth & plot rarefaction curve
+
+otu_mat <- as.data.frame(ps@otu_table)
+
+#convert to ggplot object
+
+rc_data <- rarecurve(t(otu_mat), step=100)
+
+rare_df <- map_dfr(rc_data, bind_rows) %>% 
+  bind_cols(SampleID = colnames(otu_mat), .) %>% 
+  add_column(Age = ps@sam_data$Age) %>%
+  mutate_if(is.double, as.character, is.factor, as.character) %>%
+  pivot_longer(-c(SampleID,Age)) %>%
+  drop_na() %>%
+  mutate(n_seqs = as.numeric(str_replace(name, "N", ""))) %>%
+  mutate_at("value", as.numeric) %>%
+  mutate(across(value, round, 0)) %>%
+  dplyr::select(-name)
+
+```
+
+#### Plot rarefaction curve
+
+```{r Rareplot, fig.cap="Rarecurve", echo=TRUE}
+
+ggplot(rare_df, aes(x=n_seqs, y=value, group=SampleID, colour=Age)) +
+  geom_vline(xintercept = 30000, color="darkgray") +
+  geom_line() +
+  scale_color_manual(values=c("Adult" = "#38761D", "Juvenile" = "#96d67a")) +
+  labs(y = "Observed ASVs", x = "Sequencing Depth")
+
+```
+
+#### estimate potential optimal subsampling depth
+
+```{r depth, echo=TRUE, warning=FALSE, error=FALSE, results='hide', message=FALSE}
+
+otu_mat2 <- as.data.frame(t(otu_mat))
+otu_mat2$SampleID <- rownames(otu_mat2)
+
+melted <- otu_mat2 %>% 
+  dplyr::select(SampleID, starts_with("ASV")) %>% 
+  pivot_longer(-SampleID)
+
+sampling_coverage <- melted %>%
+  group_by(SampleID) %>%
+  summarize(n_seqs = sum(value))
+
+```
+
+#### plot sampling coverage
+
+```{r samp_cov, fig.cap = "Sampling Coverage"}
+
+sampling_coverage %>%
+  ggplot(aes(x=n_seqs)) +
+  geom_histogram()
+  
+```
+
+#### correlation between alpha diversity and sequencing depth?
+
+```{r corr_test, echo=TRUE, warning=FALSE, error=FALSE, results='hide', message=FALSE}
+
+adiv_all <- data.frame(
+  "Chao1" = estimate_richness(ps, measures="Chao1"),
+  "Shannon" = estimate_richness(ps, measures="Shannon"),
+  "Inv Simpson" = estimate_richness(ps, measures="InvSimpson"),
+  data.frame(data.frame(sample_data(ps))),
+  "Depth" = sample_sums(ps)
+)
+
+
+```
+
+#### is there a correlation between sequencing depth and Shannon?
+
+```{r corr_depth, echo=TRUE, error=FALSE, message=FALSE, warning=FALSE}
+
+adiv_all %>% 
+  ggplot(aes(x=Depth, y=Shannon)) +
+  geom_point(aes(color=factor(Age))) +
+  geom_smooth(formula="y~x", method="lm", se=FALSE)
+
+#slight associateion between low read counts and low diversity
+
+boxplot(Shannon ~ Age, adiv_all)
+boxplot(Shannon ~ Age:Timepoint, data=adiv_all, col=c("blue", "red"), las=2)
+
+```
+
+#### apply CSS normalization
+
+```{r CSS, echo=TRUE, warning=FALSE, error=FALSE, results='hide', message=FALSE}
+
+mg.ps <- phyloseq_to_metagenomeSeq(ps_sub) 
+#Calculate the proper percentile by which to normalize counts 
+cNstat <- metagenomeSeq::cumNormStatFast(mg.ps) # cNstat #0.5 
+#Normalise counts 
+mg.ps <- metagenomeSeq::cumNorm(mg.ps, p = cNstat) 
+#Export the normalised count table 
+metag.norm.counts <- metagenomeSeq::MRcounts(mg.ps, norm = TRUE) 
+
+# Make a new phyloseq object with with the new OTU table
+#first transform back into integer counts
+otu_CSS <- otu_table(metag.norm.counts, taxa_are_rows = TRUE)
+ps_CSS <- phyloseq(otu_CSS, TAX, sampledata, phy_tree(tree)) 
+ps_CSS <- transform_sample_counts(ps_CSS, function(x) round(x, digits = 0))
+
+```
+
+### Alpha Diversity Analysis
+
+#### calculate metrics on normalized data
+
+```{r adiv, echo=TRUE, error=FALSE, warning=FALSE, paged.print=TRUE, message=FALSE}
+
+adiv_css <- data.frame(
+  "Chao1" = estimate_richness(ps_CSS, measures="Chao1"),
+  "Shannon" = estimate_richness(ps_CSS, measures="Shannon"),
+  "Inv Simpson" = estimate_richness(ps_CSS, measures="InvSimpson"),
+  "Pielou" = microbiome::alpha(ps_CSS, index="evenness_pielou"),
+  data.frame(data.frame(sample_data(ps_CSS)))
+)
+
+adiv_css <- adiv_css %>% mutate_at(vars(Chao1.Chao1), ~round(.,0))
+
+write.xlsx(adiv_css, "04_reports/alphadiversity_complete.xlsx", colNames = TRUE, rowNames = TRUE)
+
+adiv_css %>%
+  kbl() %>%
+  kable_styling()
+
+```
+
+#### Alpha Diversity Plots
+
+```{r alphaplot, echo=TRUE, warning=FALSE, error=FALSE, message=FALSE, results='hide'}
+#re-load xlsx file
+adiv_css <- read.xlsx("04_reports/alphadiversity_complete.xlsx")
+
+
+#modify labeling 
+
+adiv_css$Timepoint <- gsub("t0", "Pre-Treatment", adiv_css$Timepoint)
+adiv_css$Timepoint <- gsub("t10", "Treatment", adiv_css$Timepoint)
+adiv_css$Timepoint <- gsub("t14", "4d post-treatment", adiv_css$Timepoint)
+adiv_css$Timepoint <- gsub("t21", "11d post-treatment", adiv_css$Timepoint)
+adiv_css$Timepoint <- gsub("t28", "18d post-treatment", adiv_css$Timepoint)
+
+#set order for labeling
+adiv_css$Timepoint <- factor(adiv_css$Timepoint, levels=c("Pre-Treatment", "Treatment", "4d post-treatment", "11d post-treatment", "18d post-treatment"))
+
+
+#plot both ages seperately to visualize treatment effect better
+#set level
+adiv_css$Treatment <- factor(adiv_css$Treatment, levels=c("Control", "Florfenicol", "Mixture", "PAA"))
+
+Label <- c("Treatment", "Age")
+adiv_css$Label <- apply(adiv_css[, Label], 1, paste, collapse = "-")
+
+adiv_Adult <- subset(adiv_css, Age == "Adult")
+adiv_Juv <- subset(adiv_css, Age == "Juvenile")
+
+alphaAdult_shann <- ggplot(adiv_Adult, aes(x=Treatment, y=Shannon, col=Treatment))+geom_boxplot(outlier.color=NA) +
+  labs(x="Treatment", y="Shannon Diversity") +
+  theme_classic() +
+  scale_color_manual(values=treatment) + 
+  theme(
+    axis.text.y = element_text(family = "Arial", color = "black"),
+    #axis.text.x = element_text(family = "Arial", color = "black", angle=45, vjust=1.0, hjust=1.0), 
+    axis.text.x=element_blank(),
+    axis.title.x=element_blank(),
+    axis.title = element_text(family = "Arial", color = "black"),    
+    legend.text = element_text(family = "Arial", color = "black"),
+    legend.title = element_text(family = "Arial", color = "black", face="bold"),
+    strip.text = element_text(family = "Arial", color = "black", face="bold")     
+  ) +
+  theme(strip.text.x=element_text(face="bold")) +
+  facet_grid(. ~ Timepoint)
+
+
+alphaAdult_rich <- ggplot(adiv_Adult, aes(x=Treatment, y=Chao1.Chao1, col=Treatment))+geom_boxplot(outlier.color=NA) +
+  labs(x="Treatment", y="Observed ASVs") +
+  theme_classic() +
+  scale_color_manual(values=treatment) +
+      theme(
+    axis.text.y = element_text(family = "Arial", color = "black"),
+    axis.text.x = element_text(family = "Arial", color = "black", angle=45, vjust=1.0, hjust=1.0), 
+    axis.title = element_text(family = "Arial", color = "black"),    
+    legend.text = element_text(family = "Arial", color = "black"),
+    legend.title = element_text(family = "Arial", color = "black", face="bold"),
+    strip.text = element_text(family = "Arial", color = "black", face="bold")     
+  ) +
+  theme(strip.text.x=element_text(face="bold")) +
+  facet_grid(. ~ Timepoint)
+
+
+
+alphaJuv_shann <- ggplot(adiv_Juv, aes(x=Treatment, y=Shannon, col=Treatment))+geom_boxplot(outlier.color=NA) +
+  labs(x="Treatment", y="Shannon Diversity") +
+  theme_classic() +
+  scale_color_manual(values=treatment) + 
+  theme(
+    axis.text.y = element_text(family = "Arial", color = "black"),
+    #axis.text.x = element_text(family = "Arial", color = "black", angle=45, vjust=1.0, hjust=1.0),
+    axis.text.x=element_blank(),
+    axis.title.x=element_blank(),
+    axis.title = element_text(family = "Arial", color = "black"),    
+    legend.text = element_text(family = "Arial", color = "black"),
+    legend.title = element_text(family = "Arial", color = "black", face="bold"),
+    strip.text = element_text(family = "Arial", color = "black", face="bold")     
+  ) +
+  theme(strip.text.x=element_text(face="bold")) +
+  facet_grid(. ~ Timepoint)
+
+
+alphaJuv_rich <- ggplot(adiv_Juv, aes(x=Treatment, y=Chao1.Chao1, col=Treatment))+geom_boxplot(outlier.color=NA) +
+  labs(x="Treatment", y="Observed ASVs") +
+  theme_classic() +
+  scale_color_manual(values=treatment) +
+  theme(strip.text.x=element_text(face="bold")) +
+  theme(
+    axis.text.y = element_text(family = "Arial", color = "black"),
+    axis.text.x = element_text(family = "Arial", color = "black", angle=45, vjust=1.0, hjust=1.0), 
+    axis.title = element_text(family = "Arial", color = "black"),    
+    legend.text = element_text(family = "Arial", color = "black"),
+    legend.title = element_text(family = "Arial", color = "black", face="bold"),
+    strip.text = element_text(family = "Arial", color = "black", face="bold")     
+  ) +
+  facet_grid(. ~ Timepoint)
+
+#prepare panel plot
+
+rich <- ggarrange(alphaAdult_rich, alphaJuv_rich, labels="auto", ncol=1, nrow=2, common.legend = TRUE)
+shann <-ggarrange(alphaAdult_shann, alphaJuv_shann, labels="auto", ncol=1, nrow=2, common.legend = TRUE)
+
+#complete panel
+alpha <- ggarrange(alphaAdult_shann, alphaJuv_shann, alphaAdult_rich, alphaJuv_rich, ncol=2, nrow=2, common.legend=TRUE,legend="right", align="v")
+
+#plot direct comparison between age groups
+#Richness
+alpha_rich_all <- ggplot(adiv_css, aes(x=Treatment, y=Chao1.Chao1, col=Label))+geom_boxplot(outlier.color=NA) +
+  labs(x="Treatment", y="Observed ASVs") +
+  theme_classic() +
+  scale_color_manual(values=age_treat) +
+  theme(strip.text.x=element_text(face="bold")) +
+  theme(
+    axis.text.y = element_text(family = "Arial", color = "black"),
+    axis.text.x = element_text(family = "Arial", color = "black", angle=45, vjust=1.0, hjust=1.0), 
+    axis.title = element_text(family = "Arial", color = "black"),    
+    legend.text = element_text(family = "Arial", color = "black"),
+    legend.title = element_text(family = "Arial", color = "black", face="bold"),
+    strip.text = element_text(family = "Arial", color = "black", face="bold")     
+  ) +
+  facet_grid(. ~ Timepoint)
+
+alpha_shann_all <- ggplot(adiv_css, aes(x=Treatment, y=Shannon, col=Label))+geom_boxplot(outlier.color=NA) +
+  labs(x="Treatment", y="Shannon Diversity") +
+  theme_classic() +
+  scale_color_manual(values=age_treat) +
+  theme(strip.text.x=element_text(face="bold")) +
+  theme(
+    axis.text.y = element_text(family = "Arial", color = "black"),
+    axis.text.x = element_text(family = "Arial", color = "black", angle=45, vjust=1.0, hjust=1.0), 
+    axis.title = element_text(family = "Arial", color = "black"),    
+    legend.text = element_text(family = "Arial", color = "black"),
+    legend.title = element_text(family = "Arial", color = "black", face="bold"),
+    strip.text = element_text(family = "Arial", color = "black", face="bold")     
+  ) +
+  facet_grid(. ~ Timepoint)
+
+#prepare panel plot - final plot used for publication
+
+alpha_all <- ggarrange(alpha_rich_all, alpha_shann_all, ncol=1, nrow=2, common.legend=TRUE,legend="right", align="v", labels="auto")
+```
+
+#### Alpha Diversity - Check Distribution & Assumptions
+
+```{r distri, eval=TRUE, warning=FALSE, error=FALSE, message=FALSE}
+
+#check distribution of the data
+#both datasets in comparison
+#Richness
+hist(adiv_css$Chao1.Chao1)
+qqnorm(adiv_css$Chao1.Chao1)
+qqline(adiv_css$Chao1.Chao1, col="steelblue", lwd=2)
+
+
+#Shannon Diversity
+hist(adiv_css$Shannon)
+qqnorm(adiv_css$Shannon)
+qqline(adiv_css$Shannon, col="steelblue", lwd=2)
+
+
+#adult
+#richness
+hist(adiv_Adult$Chao1.Chao1)
+qqnorm(adiv_Adult$Chao1.Chao1)
+qqline(adiv_Adult$Chao1.Chao1, col="steelblue", lwd=2)
+
+
+#shannon
+hist(adiv_Adult$Shannon)
+qqnorm(adiv_Adult$Shannon)
+qqline(adiv_Adult$Shannon, col="steelblue", lwd=2)
+
+
+#juvenile
+#richness
+hist(adiv_Juv$Chao1.Chao1)
+qqnorm(adiv_Juv$Chao1.Chao1)
+qqline(adiv_Juv$Chao1.Chao1, col="steelblue", lwd=2)
+
+
+#shannon
+hist(adiv_Juv$Shannon)
+qqnorm(adiv_Juv$Shannon)
+qqline(adiv_Juv$Shannon, col="steelblue", lwd=2)
+
+
+##test for homogenity of variance
+## richness - bartlett test as those are normal distributed
+
+bart_richA <- bartlett.test(Chao1.Chao1 ~ interaction(Treatment,Timepoint), data=adiv_Adult)
+bart_richA
+
+bart_richJ <- bartlett.test(Chao1.Chao1 ~ interaction(Treatment,Timepoint), data=adiv_Juv)
+bart_richJ
+
+library(car)
+lev_shannA <- leveneTest(Shannon ~ Treatment*Timepoint*Sex, data=adiv_Adult)
+lev_shannA
+
+lev_shannJ <- leveneTest(Shannon ~ Treatment*Timepoint, data=adiv_Juv)
+lev_shannJ
+
+
+#test for collinearity of variables
+
+#subset dataframe to only the relevant metadata
+sub_adivA <- adiv_Adult[,c(1:5,7:14,17:19)]
+corrplot <- ggpairs(sub_adivA)
+
+sub_adivJ <- adiv_Juv[,c(1:5,7:13,17:19)]
+corrplotJ <- ggpairs(sub_adivJ)
+
+```
+
+#### Alpha Diversity - Statistical Analysis
+
+```{r stats, eval=TRUE, warning=FALSE, error=FALSE}
+
+#application of a generalized linear model
+
+#prepare a full model will all samples together
+#goodness-of-fit-criteria used to estimate optimal model fit
+
+model_all <- stepAIC(glm(Shannon ~ 1, data=adiv_css), scope=list(upper = Shannon ~ Treatment + Timepoint + Age + Oxygen  + pH + Ammonium), direction="forward",trace=1)
+#best model fit includes Oxygen + Treatment + Ammonium, however differences are very small so only focus on relevant variables
+
+#final model
+
+glm_all <- glm(Shannon ~ Treatment + Timepoint  + Age + Treatment*Timepoint, data=adiv_css, family=gaussian)
+summary(glm_all)
+plot(glm_all)
+
+plot(predictorEffects(glm_all))
+
+aov.shann <- aov(glm_all)
+summary(aov.shann)
+#no signficant difference 
+
+#Richness - full model
+
+model_allR <- stepAIC(glm(Chao1.Chao1 ~ 1, data=adiv_css), scope=list(upper = Chao1.Chao1 ~ Treatment + Timepoint + Age + Oxygen  + pH + Ammonium), direction="forward",trace=1)
+
+glm_allR <- glm(Chao1.Chao1 ~ Treatment + Timepoint + Age + Treatment*Timepoint, data=adiv_css, family=gaussian)
+summary(glm_allR)
+plot(glm_allR)
+
+aov.rich <- aov(glm_allR)
+summary(aov.rich)
+
+plot(predictorEffects(glm_allR))
+
+#Shannon - Adult
+adiv_Adult <- subset(adiv_css, Age == "Adult")
+model_adult <- stepAIC(glm(Shannon ~ 1, data=adiv_Adult), scope=list(upper = Shannon ~ Treatment + Timepoint + Sex + Oxygen  + pH + Ammonium), direction="forward",trace=1)
+
+#final model
+
+glm_adult <- glm(Shannon ~ Treatment + Timepoint + Sex + Treatment*Timepoint, data=adiv_Adult, family=gaussian)
+summary(glm_adult)
+plot(glm_adult)
+aov.shann.a <- aov(glm_adult)
+summary(aov.shann.a)
+
+plot(predictorEffects(glm_adult))
+
+#Richness - Adult
+
+glm_adultR <- glm(Chao1.Chao1 ~ Treatment + Timepoint + Sex + Treatment*Timepoint, data=adiv_Adult, family=gaussian)
+summary(glm_adultR)
+plot(glm_adultR)
+aov.rich.a <- aov(glm_adultR)
+summary(aov.rich.a)
+
+plot(predictorEffects(glm_adultR))
+
+#Shannon - Juvenile: 
+adiv_Juv <- subset(adiv_css, Age == "Juvenile")
+model_juv <- stepAIC(glm(Shannon ~ 1, data=adiv_Juv), scope=list(upper = Shannon ~ Treatment + Timepoint +  Oxygen  + pH + Ammonium), direction="forward",trace=1)
+
+glm_juv <- glm(Shannon ~ Treatment + Timepoint + Treatment*Timepoint , data=adiv_Juv, family=gaussian)
+summary(glm_juv)
+plot(glm_juv)
+aov.shann.j <- aov(glm_juv)
+summary(aov.shann.j)
+
+plot(predictorEffects(glm_juv))
+
+#Richness - Juvenile: 
+
+glm_juvR <- glm(Chao1.Chao1 ~ Treatment + Timepoint + Treatment*Timepoint, data=adiv_Juv, family=gaussian)
+summary(glm_juvR)
+plot(glm_juvR)
+aov.rich.j <- aov(glm_juvR)
+summary(aov.rich.j)
+
+#add wilcoxon test for d10 of the adult group to estimate whether observed differences on boxplot are significant
+
+#seperate control group at d10
+
+data_con10 <- adiv_Adult %>%
+  dplyr::select("Chao1.Chao1", "Treatment", "Timepoint") %>%
+  filter(Treatment == "Control", Timepoint == "Treatment")
+
+#filter data
+
+data <- adiv_Adult %>%
+  dplyr::filter(Treatment != "Control", Timepoint == "Treatment") %>%
+  group_by(Treatment) %>%
+  summarise(p_val = wilcox.test(data_con10$Chao1.Chao1, Chao1.Chao1, exact = FALSE)$p.val)
+
+#nothing significant
+
+#d0
+
+data_con0 <- adiv_Adult %>%
+  dplyr::select("Chao1.Chao1", "Treatment", "Timepoint") %>%
+  filter(Treatment == "Control", Timepoint == "Pre-Treatment")
+
+#filter data
+
+data0 <- adiv_Adult %>%
+  dplyr::filter(Treatment != "Control", Timepoint == "Pre-Treatment") %>%
+  group_by(Treatment) %>%
+  summarise(p_val = wilcox.test(data_con0$Chao1.Chao1, Chao1.Chao1, exact = FALSE)$p.val)
+
+
+
+```
+
+### Beta Diversity Analysis
+
+#### Calculation and Plots
+
+```{r beta, echo=TRUE, warning=FALSE, error=FALSE, eval=TRUE}
+set.seed(713)
+
+#control groups NMDS - how does host age shape microbiome composition?
+#split by age group
+
+#control groups over time
+
+ps_control <- subset_samples(ps_CSS, Treatment == "Control")
+dist_con <- ordinate(ps_control, "NMDS", "bray")
+dist_con #0.1928
+
+nmds_con <- plot_ordination(ps_control, dist_con, type="samples", color="Timepoint", shape="Age") +
+geom_point(size=3) +
+scale_color_manual(values=timepoint) +
+  theme(plot.title=element_text(hjust=0.5, face="bold"), plot.subtitle=element_text(hjust=0.5)) +
+  stat_ellipse(aes(color=Age), type="norm")
+
+#by sampling timepoint
+
+nmds_con <- plot_ordination(ps_control, dist_con, type="samples", color="Timepoint", shape="Age") +
+geom_point(size=3) +
+scale_color_manual(values=timepoint) +
+  theme(plot.title=element_text(hjust=0.5, face="bold"), plot.subtitle=element_text(hjust=0.5)) +
+  stat_ellipse(aes(color=Age), type="norm")
+
+# estimate treatment effect by pairwise comparisons between control vs. one treatment
+
+#split ps objects by age and treatments
+
+ps_adult <- subset_samples(ps_CSS, Age == "Adult")
+ps_juv <- subset_samples(ps_CSS, Age == "Juvenile")
+
+
+ps_CFF_a <- subset_samples(ps_adult, Treatment %in% c("Control", "Florfenicol"))
+ps_CMix_a <- subset_samples(ps_adult, Treatment %in% c("Control", "Mixture"))
+ps_CPAA_a <- subset_samples(ps_adult, Treatment %in% c("Control", "PAA"))
+
+ps_CFF_j <- subset_samples(ps_juv, Treatment %in% c("Control", "Florfenicol"))
+ps_CMix_j <- subset_samples(ps_juv, Treatment %in% c("Control", "Mixture"))
+ps_CPAA_j <- subset_samples(ps_juv, Treatment %in% c("Control", "PAA"))
+
+
+# calculate for both age groups and treatments included
+age_col <- c("Adult" = "#bcbcbc", "Juvenile" = "#d0d0d0")
+
+dist_all <- ordinate(ps_CSS, "NMDS", "bray")
+dist_all
+
+nmds_all <- plot_ordination(ps_CSS, dist_all, type="samples", color="Treatment", shape="Age") +
+geom_point(size=3) +
+scale_color_manual(values=treatment) +
+  stat_ellipse(aes(group=Age, color=Age),type="norm") +
+   theme(
+    axis.text.y = element_text(family = "Arial", color = "black"),
+    axis.text.x = element_text(family = "Arial", color = "black"), 
+    axis.title = element_text(family = "Arial", color = "black"),    
+    legend.text = element_text(family = "Arial", color = "black"),
+    legend.title = element_text(family = "Arial", color = "black", face="bold"),
+    strip.text = element_text(family = "Arial", color = "black", face="bold")     
+  )
+  
+
+
+##Adult fish
+#complete dataset, not splitted by treatments to check for general patterns
+dist_adult <- ordinate(ps_adult, "NMDS", "bray")
+dist_adult#0.19767
+nmds_adult <-  plot_ordination(ps_adult, dist_adult, type="samples", color="Timepoint", shape="Treatment") +
+geom_point(size=3) +
+scale_color_manual(values=timepoint) +
+  ggtitle(label="Adult Trout - all Treatments") +
+  theme(plot.title=element_text(hjust=0.5, face="bold"), plot.subtitle=element_text(hjust=0.5))
+
+#seperate treatment comparisons
+
+#Control vs. Florfenicol
+dist_CFFa <- ordinate(ps_CFF_a, "NMDS", "bray")
+dist_CFFa#0.1833
+nmds_CFFa <- plot_ordination(ps_CFF_a, dist_CFFa, type="samples", color="Timepoint", shape="Treatment") +
+geom_point(size=3) +
+scale_color_manual(values=timepoint) +
+  ggtitle(label="Control vs. Florfenicol (Adult)") +
+  theme(plot.title=element_text(hjust=0.5, face="bold"), plot.subtitle=element_text(hjust=0.5)) +
+  theme(
+    axis.text.y = element_text(family = "Arial", color = "black"),
+    axis.text.x = element_text(family = "Arial", color = "black"), 
+    axis.title = element_text(family = "Arial", color = "black"),    
+    legend.text = element_text(family = "Arial", color = "black"),
+    legend.title = element_text(family = "Arial", color = "black", face="bold"),
+    strip.text = element_text(family = "Arial", color = "black", face="bold")     
+  )
+
+
+#Control vs. Mixture
+
+dist_CMixa <- ordinate(ps_CMix_a, "NMDS", "bray")
+dist_CMixa #0.2034
+nmds_CMixa <- plot_ordination(ps_CMix_a, dist_CMixa, type="samples", color="Timepoint", shape="Treatment") +
+geom_point(size=3) +
+scale_color_manual(values=timepoint) +
+  ggtitle(label="Control vs. Mixture (Adult)") +
+  theme(plot.title=element_text(hjust=0.5, face="bold"), plot.subtitle=element_text(hjust=0.5)) +
+  theme(
+    axis.text.y = element_text(family = "Arial", color = "black"),
+    axis.text.x = element_text(family = "Arial", color = "black"), 
+    axis.title = element_text(family = "Arial", color = "black"),    
+    legend.text = element_text(family = "Arial", color = "black"),
+    legend.title = element_text(family = "Arial", color = "black", face="bold"),
+    strip.text = element_text(family = "Arial", color = "black", face="bold")     
+  )
+
+
+#Control vs. PAA
+
+dist_CPAAa <- ordinate(ps_CPAA_a, "NMDS", "bray")
+dist_CPAAa #0.1947
+nmds_CPAAa <- plot_ordination(ps_CPAA_a, dist_CPAAa, type="samples", color="Timepoint", shape="Treatment") +
+geom_point(size=3) +
+scale_color_manual(values=timepoint) +
+  ggtitle(label="Control vs. Peracetic Acid (Adult)") +
+  theme(plot.title=element_text(hjust=0.5, face="bold"), plot.subtitle=element_text(hjust=0.5)) +
+  theme(
+    axis.text.y = element_text(family = "Arial", color = "black"),
+    axis.text.x = element_text(family = "Arial", color = "black"), 
+    axis.title = element_text(family = "Arial", color = "black"),    
+    legend.text = element_text(family = "Arial", color = "black"),
+    legend.title = element_text(family = "Arial", color = "black", face="bold"),
+    strip.text = element_text(family = "Arial", color = "black", face="bold")     
+  )
+
+
+#juvenile fish
+
+#full dataset
+dist_juv <- ordinate(ps_juv, "NMDS", "bray")
+nmds_juv <- plot_ordination(ps_juv, dist_juv, type="samples", color="Timepoint", shape="Treatment") +
+geom_point(size=3) +
+scale_color_manual(values=timepoint) +
+  ggtitle(label="Juvenile Trouts - all Treatments") +
+  theme(plot.title=element_text(hjust=0.5, face="bold"), plot.subtitle=element_text(hjust=0.5))
+
+
+#Control vs. Florfenicol
+dist_CFFj <- ordinate(ps_CFF_j, "NMDS", "bray")
+dist_CFFj #0.1584
+nmds_CFFj <- plot_ordination(ps_CFF_j, dist_CFFj, type="samples", color="Timepoint", shape="Treatment") +
+geom_point(size=3) +
+scale_color_manual(values=timepoint) +
+  ggtitle(label="Control vs. Florfenicol (Juvenile)") +
+  theme(plot.title=element_text(hjust=0.5, face="bold"), plot.subtitle=element_text(hjust=0.5)) +
+  theme(
+    axis.text.y = element_text(family = "Arial", color = "black"),
+    axis.text.x = element_text(family = "Arial", color = "black"), 
+    axis.title = element_text(family = "Arial", color = "black"),    
+    legend.text = element_text(family = "Arial", color = "black"),
+    legend.title = element_text(family = "Arial", color = "black", face="bold"),
+    strip.text = element_text(family = "Arial", color = "black", face="bold")     
+  )
+
+
+
+#Control vs. Mixture
+
+dist_CMixj <- ordinate(ps_CMix_j, "NMDS", "bray")
+dist_CMixj #0.1443
+nmds_CMixj <- plot_ordination(ps_CMix_j, dist_CMixj, type="samples", color="Timepoint", shape="Treatment") +
+geom_point(size=3) +
+scale_color_manual(values=timepoint) +
+  ggtitle(label="Control vs. Mixture (Juvenile)") +
+  theme(plot.title=element_text(hjust=0.5, face="bold"), plot.subtitle=element_text(hjust=0.5)) +
+  theme(
+    axis.text.y = element_text(family = "Arial", color = "black"),
+    axis.text.x = element_text(family = "Arial", color = "black"), 
+    axis.title = element_text(family = "Arial", color = "black"),    
+    legend.text = element_text(family = "Arial", color = "black"),
+    legend.title = element_text(family = "Arial", color = "black", face="bold"),
+    strip.text = element_text(family = "Arial", color = "black", face="bold")     
+  )
+
+
+
+# Control vs. PAA
+
+dist_CPAAj <- ordinate(ps_CPAA_j, "NMDS", "bray")
+dist_CPAAj#0.1507
+nmds_CPAAj <- plot_ordination(ps_CPAA_j, dist_CPAAj, type="samples", color="Timepoint", shape="Treatment") +
+geom_point(size=3) +
+scale_color_manual(values=timepoint) +
+  ggtitle(label="Control vs. Peracetic Acid (Juvenile)") +
+  theme(plot.title=element_text(hjust=0.5, face="bold"), plot.subtitle=element_text(hjust=0.5)) +
+  theme(
+    axis.text.y = element_text(family = "Arial", color = "black"),
+    axis.text.x = element_text(family = "Arial", color = "black"), 
+    axis.title = element_text(family = "Arial", color = "black"),    
+    legend.text = element_text(family = "Arial", color = "black"),
+    legend.title = element_text(family = "Arial", color = "black", face="bold"),
+    strip.text = element_text(family = "Arial", color = "black", face="bold")     
+  )
+
+
+#prepare combined panel figure - final figure used for publication
+library(ggpubr)
+plist=list(nmds_CFFa, nmds_CMixa, nmds_CPAAa, nmds_CFFj, nmds_CMixj, nmds_CPAAj)
+beta_panel <- ggarrange(plotlist=plist, ncol=3, nrow=2, labels="auto", align="hv", legend="bottom", common.legend=TRUE)
+
+```
+
+#### PERMANOVA
+
+```{r permanova, echo=TRUE, warning = FALSE, error = FALSE, eval = TRUE}
+
+#start with complete model of whole dataset
+metadf <- data.frame(sample_data(ps_sub))
+bray_all <- phyloseq::distance(ps_CSS, method="bray")
+permanova <- adonis2(bray_all ~ Treatment + Timepoint + Age, data=metadf)
+
+#homogeneity of dispersion test
+beta <- betadisper(bray_all, metadf$Age)
+permutest(beta)#not significant
+anova(beta)
+
+betaTreat <- betadisper(bray_all, metadf$Treatment)
+permutest(betaTreat)#not significant
+anova(betaTreat)
+
+betaTime <- betadisper(bray_all, metadf$Timepoint)
+permutest(betaTime)#significant, as expected from area plot
+anova(betaTime)
+
+#adult subset
+
+metadfA <- data.frame(sample_data(ps_adult))
+bray_adult <- phyloseq::distance(ps_adult, method="bray")
+
+permanovaA <- adonis2(bray_adult ~ Treatment + Timepoint + Treatment*Timepoint, data=metadfA, permutations=9999)#all significant
+
+pw.permaA <- pairwise.adonis2(bray_adult ~ Treatment + Timepoint + Treatment:Timepoint, data = metadfA, permutations=9999)
+
+#subset to seperate timepoints to identify where the interaction effect is coming from & how long treatment effect lasts
+
+ps_t10 <- subset_samples(ps_CSS, Age == "Adult" & Timepoint == "t10")
+metadf10 <- data.frame(sample_data(ps_t10))
+bray_t10 <- phyloseq::distance(ps_t10, method="bray")
+
+pw.perma <- pairwise.adonis2(bray_t10 ~ Treatment, data=metadf10, nperm=9999)
+
+#t14
+ps_t14 <- subset_samples(ps_CSS, Age == "Adult" & Timepoint == "t14")
+metadf14 <- data.frame(sample_data(ps_t14))
+bray_t14 <- phyloseq::distance(ps_t14, method="bray")
+
+pw.perma <- pairwise.adonis2(bray_t14 ~ Treatment, data=metadf14, nperm=9999)
+
+#t21:
+
+ps_t21 <- subset_samples(ps_CSS, Age == "Adult" & Timepoint == "t21")
+metadf21 <- data.frame(sample_data(ps_t21))
+bray_t21 <- phyloseq::distance(ps_t21, method="bray")
+
+pw.perma <- pairwise.adonis2(bray_t21 ~ Treatment, data=metadf21, nperm=9999)
+
+#t28
+ps_t28 <- subset_samples(ps_CSS, Age == "Adult" & Timepoint == "t28")
+metadf28 <- data.frame(sample_data(ps_t28))
+bray_t28 <- phyloseq::distance(ps_t28, method="bray")
+
+pw.perma <- pairwise.adonis2(bray_t28 ~ Treatment, data=metadf28, nperm=9999)
+
+#betadisper
+
+betaA <- betadisper(bray_adult, metadfA$Treatment)
+permutest(betaA)#not significant
+
+betat121 <- betadisper(bray_t21, metadf21$Treatment)
+permutest(betat121)
+anova(betat121) #
+
+betat28 <- betadisper(bray_t28, metadf28$Treatment)
+permutest(betat28)
+anova(betat28)
+
+
+betaAT <- betadisper(bray_adult, metadfA$Timepoint)
+permutest(betaAT)#significant
+beta.HSD <- TukeyHSD(betaAT)
+plot(beta.HSD)
+
+#juvenile
+metadfJ <- data.frame(sample_data(ps_juv))
+bray_juv <- phyloseq::distance(ps_juv, method="bray")
+
+permanovaJ <- adonis2(bray_juv ~ Treatment + Timepoint + Treatment*Timepoint, data=metadfJ)
+betaJ <- betadisper(bray_juv, metadfJ$Treatment)
+permutest(betaJ)#not significant
+
+betaJT <- betadisper(bray_juv, metadfJ$Timepoint)
+permutest(betaJT)#significant
+plot(betaJT)
+betaJT.HSD <- TukeyHSD(betaJT)
+plot(betaJT.HSD)
+
+pw.permaJ <- pairwise.adonis2(bray_juv ~ Treatment + Timepoint + Treatment:Timepoint, data = metadfJ, permutations=9999)
+
+#pairwise testing per timepoint
+
+ps_t10 <- subset_samples(ps_CSS, Age == "Juvenile" & Timepoint == "t10")
+metadf10 <- data.frame(sample_data(ps_t10))
+bray_t10 <- phyloseq::distance(ps_t10, method="bray")
+
+pw.perma <- pairwise.adonis2(bray_t10 ~ Treatment, data=metadf10, nperm=9999)
+
+#t14
+ps_t14 <- subset_samples(ps_CSS, Age == "Juvenile" & Timepoint == "t14")
+metadf14 <- data.frame(sample_data(ps_t14))
+bray_t14 <- phyloseq::distance(ps_t14, method="bray")
+
+pw.perma <- pairwise.adonis2(bray_t14 ~ Treatment, data=metadf14, nperm=9999)
+
+#t21:
+
+ps_t21 <- subset_samples(ps_CSS, Age == "Juvenile" & Timepoint == "t21")
+metadf21 <- data.frame(sample_data(ps_t21))
+bray_t21 <- phyloseq::distance(ps_t21, method="bray")
+
+pw.perma <- pairwise.adonis2(bray_t21 ~ Treatment, data=metadf21, nperm=9999)
+
+#t28
+ps_t28 <- subset_samples(ps_CSS, Age == "Juvenile" & Timepoint == "t28")
+metadf28 <- data.frame(sample_data(ps_t28))
+bray_t28 <- phyloseq::distance(ps_t28, method="bray")
+
+pw.perma <- pairwise.adonis2(bray_t28 ~ Treatment, data=metadf28, nperm=9999)
+
+#betadispersion to test for within group variability
+
+betat14 <- betadisper(bray_t14, metadf14$Treatment)
+permutest(betat14)
+anova(betat14)
+
+betat121 <- betadisper(bray_t21, metadf21$Treatment)
+permutest(betat121)
+anova(betat121)
+```
+
+### Microbiome Composition
+
+#### Data Extraction
+
+```{r composition, echo=TRUE, error=FALSE, warning=FALSE, paged.print=TRUE, message=FALSE}
+
+#extract full melted dataframe on genus level
+
+genus_full <- ps_CSS %>%
+  transform_sample_counts(function(x) 100*x/sum(x)) %>%
+  tax_glom("Genus") %>%
+  psmelt()
+
+write.xlsx(genus_full, "04_reports/Genus_abundance_complete.xlsx")
+
+#extract mean abundances grouped by timepoint & treatment and split by age
+#adult
+genus_adult <- ps_adult %>%
+  transform_sample_counts(function(x) 100*x/sum(x)) %>%
+  tax_glom("Genus") %>%
+  psmelt()
+  
+gen_summary_adult <- genus_adult %>%
+  group_by(Genus, Treatment, Timepoint) %>%
+  summarise(mean=mean(Abundance), n=n())
+
+fam_adult <- ps_adult %>%
+  transform_sample_counts(function(x) 100*x/sum(x)) %>%
+  tax_glom("Family") %>%
+  psmelt()
+
+fam_summary_adult <- fam_adult %>%
+  group_by(Family, Treatment, Timepoint) %>%
+  summarise(mean=mean(Abundance), n=n())
+
+phylum_adult <- ps_adult %>%
+  transform_sample_counts(function(x) 100*x/sum(x)) %>%
+  tax_glom("Phylum") %>%
+  psmelt()
+
+phyl_summary_adult <- phylum_adult %>%
+  group_by(Phylum, Treatment, Timepoint) %>%
+  summarise(mean=mean(Abundance), n=n())
+
+list_of_datasets <- list("Phylum" = phyl_summary_adult, "Family" = fam_summary_adult, "Genus" = gen_summary_adult)
+write.xlsx(list_of_datasets, file = "04_reports/Taxa_abundance_adult.xlsx")
+
+#juvenile
+
+genus_juv <- ps_juv %>%
+  transform_sample_counts(function(x) 100*x/sum(x)) %>%
+  tax_glom("Genus") %>%
+  psmelt()
+  
+gen_summary_juv <- genus_juv %>%
+  group_by(Genus, Treatment, Timepoint) %>%
+  summarise(mean=mean(Abundance), n=n())
+
+fam_juv <- ps_juv1 %>%
+  transform_sample_counts(function(x) 100*x/sum(x)) %>%
+  tax_glom("Family") %>%
+  psmelt()
+
+fam_summary_juv <- fam_juv %>%
+  group_by(Family, Treatment, Timepoint) %>%
+  summarise(mean=mean(Abundance), n=n())
+
+phylum_juv <- ps_juv %>%
+  transform_sample_counts(function(x) 100*x/sum(x)) %>%
+  tax_glom("Phylum") %>%
+  psmelt()
+
+phyl_summary_juv <- phylum_juv %>%
+  group_by(Phylum, Treatment, Timepoint) %>%
+  summarise(mean=mean(Abundance), n=n())
+
+list_of_datasets2 <- list("Phylum" = phyl_summary_juv, "Family" = fam_summary_juv, "Genus" = gen_summary_juv)
+write.xlsx(list_of_datasets2, file = "04_reports/Taxa_abundance_juv.xlsx")
+
+#full datasaet
+#phylum level
+
+phylum_all <- ps_CSS %>%
+  transform_sample_counts(function(x) 100*x/sum(x)) %>%
+  tax_glom("Phylum") %>%
+  psmelt()
+
+phyl_summary_all <- phylum_all %>%
+  group_by(Phylum, Treatment, Timepoint, Age) %>%
+  summarise(mean=mean(Abundance), n=n())
+
+#phylum control only
+
+phylum_all_con <- ps_CSS %>%
+  transform_sample_counts(function(x) 100*x/sum(x)) %>%
+  tax_glom("Phylum") %>%
+  subset_samples(Treatment == "Control") %>%
+  psmelt()
+
+phyl_summary_con <- phylum_all_con %>%
+  group_by(Phylum, Timepoint, Age) %>%
+  summarise(mean=mean(Abundance), n=n())
+
+#genus level
+
+genus_all <- ps_CSS %>%
+  transform_sample_counts(function(x) 100*x/sum(x)) %>%
+  tax_glom("Genus") %>%
+  psmelt()
+
+genus_summary_all <- genus_all %>%
+  group_by(Genus, Treatment, Timepoint, Age) %>%
+  summarise(mean=mean(Abundance), n=n())
+
+#genus control only
+
+genus_con <- ps_CSS %>%
+  transform_sample_counts(function(x) 100*x/sum(x)) %>%
+  tax_glom("Genus") %>%
+  subset_samples(Treatment == "Control") %>%
+  psmelt()
+
+genus_summary_con <- genus_con %>%
+  group_by(Genus, Timepoint, Age) %>%
+  summarise(mean=mean(Abundance), n=n())
+
+```
+
+#### Area Plots
+
+```{r area, echo = T, warning = F, error = F, paged.print=T }
+
+#area plots - dynamic changes over time per treatment
+
+# adult
+#phylum level
+
+phyl_summary_adult$Phylum[phyl_summary_adult$mean < 1] <- "Others"
+
+table(unique(phyl_summary_adult$Phylum))
+
+col_pA <- c("Proteobacteria" = "#89BF71", 
+           "Bacteroidota" = "#95C7F6", 
+           "Firmicutes" = "#C19BD2", 
+           "unclassified" = "#f4a34e", 
+           "Actinobacteriota" = "#5091CB",
+          "Myxococcota" = "#54863f", 
+           "Chloroflexi" = "#8571B8", 
+           "Fusobacteriota" = "#E06A6A", 
+           "Others" = "#906179",
+           "Spirochaetota" = "#a9a9a9"
+           )
+
+
+phyl_summary_adult$Timepoint <- as.numeric(gsub("t","", phyl_summary_adult$Timepoint))
+
+phyl_summary_adult <- phyl_summary_adult %>%
+  ungroup() %>%
+  drop_na() %>%
+  complete(Phylum, Timepoint, Treatment, fill = list("mean"= 0))
+
+phylum_area <- ggplot(phyl_summary_adult) +
+  geom_area(aes(x = Timepoint, y = mean, fill = Phylum, stat="identity")) +
+  facet_wrap(~Treatment) +
+  scale_fill_manual(values=col_pA) +
+  labs(title = "Relative Abundance of Phyla Over Time - Adult",
+       x = "Timepoint",
+       y = "Relative Abundance (%)",
+       fill = "Phylum") +
+  theme_minimal() +
+  scale_x_continuous(breaks=phyl_summary_adult$Timepoint) +
+  theme(legend.text = element_text(face="italic"))+ 
+  theme(legend.title=element_text(face="bold"), legend.position = "bottom") +
+  theme(plot.title = element_text(face="bold",hjust=0.5))
+
+
+#family 
+
+fam_summary_adult$Family[fam_summary_adult$mean < 2] <- "Others"
+
+fam_summary_adult$Family <- factor(fam_summary_adult$Family)
+length(table(fam_summary_adult$Family))
+nb.cols <- 28
+col_f <- colorRampPalette(brewer.pal(12, "Paired"))(nb.cols)
+names(col_f) <- levels(fam_summary_adult$Family)
+col_f  
+
+fam_summary_adult$Timepoint <- as.numeric(gsub("t","", fam_summary_adult$Timepoint))
+
+fam_summary_adult <- fam_summary_adult %>%
+  ungroup() %>%
+  drop_na() %>%
+  complete(Family, Timepoint, Treatment, fill = list("mean"= 0))
+
+family_area <- ggplot(fam_summary_adult) +
+  geom_area(aes(x = Timepoint, y = mean, fill = Family, stat="identity")) +
+  facet_wrap(~Treatment) +
+  scale_fill_manual(values=col_f) +
+  labs(title = "Relative Abundance of bacterial families over time - Adult",
+       x = "Timepoint",
+       y = "Relative Abundance (%)",
+       fill = "Family") +
+  theme_minimal() +
+  scale_x_continuous(breaks=fam_summary_adult$Timepoint) +
+  theme(legend.text = element_text(face="italic"))+ 
+  theme(legend.title=element_text(face="bold"), legend.position = "bottom") +
+  theme(plot.title = element_text(face="bold",hjust=0.5))
+
+#genus
+ 
+genus2A <- ps_adult1 %>%
+  transform_sample_counts(function(x) 100*x/sum(x)) %>%
+  tax_glom("Genus")
+
+top35 <- names(sort(taxa_sums(genus2A), decreasing = TRUE))[1:35]#select top35
+gen_subA <- prune_taxa(top35, genus2A) %>%
+  psmelt()
+
+
+gen_subA$Genus <- factor(gen_subA$Genus)
+length(table(gen_subA$Genus))
+nb.cols <- 31
+col_g <- colorRampPalette(brewer.pal(12, "Paired"))(nb.cols)
+names(col_g) <- levels(gen_subA$Genus)
+col_g 
+
+gen_subA$Timepoint <- as.numeric(gsub("t","", gen_subA$Timepoint))
+
+gen_subA <- gen_subA %>%
+  group_by(Genus, Treatment, Timepoint) %>%
+  summarise(mean=mean(Abundance), n=n()) %>%
+  ungroup() %>%
+  drop_na() %>%
+  complete(Genus, Timepoint, Treatment, fill = list("mean"= 0))
+
+genus_area <- ggplot(gen_subA) +
+  geom_area(aes(x = Timepoint, y = mean, fill = Genus, stat="identity")) +
+  facet_wrap(~Treatment) +
+  scale_fill_manual(values=col_g) +
+  labs(title = "Relative Abundance of top 30 abundant genera over time - Adult",
+       x = "Timepoint",
+       y = "Relative Abundance (%)",
+       fill = "Genus") +
+  theme_minimal() +
+  scale_x_continuous(breaks=gen_subA$Timepoint) +
+  theme(legend.text = element_text(face="italic"))+ 
+  theme(legend.title=element_text(face="bold"), legend.position = "bottom") +
+  theme(plot.title = element_text(face="bold",hjust=0.5))
+
+
+#juvenile samples
+#phylum level
+
+phyl_summary_juv$Phylum[phyl_summary_juv$mean < 1] <- "Others"
+
+table(unique(phyl_summary_juv$Phylum))
+
+col_pJ <- c("Proteobacteria" = "#89BF71", 
+           "Bacteroidota" = "#95C7F6", 
+           "Firmicutes" = "#C19BD2", 
+           "unclassified" = "#f4a34e", 
+           "Actinobacteriota" = "#5091CB",
+          "Myxococcota" = "#54863f", 
+           "Chloroflexi" = "#8571B8", 
+           "Fusobacteriota" = "#E06A6A", 
+           "Others" = "#906179"
+           )
+
+
+
+
+phyl_summary_juv$Timepoint <- as.numeric(gsub("t","", phyl_summary_juv$Timepoint))
+
+phyl_summary_juv <- phyl_summary_juv %>%
+  ungroup() %>%
+  drop_na() %>%
+  complete(Phylum, Timepoint, Treatment, fill = list("mean"= 0))
+
+phylum_areaJ <- ggplot(phyl_summary_juv) +
+  geom_area(aes(x = Timepoint, y = mean, fill = Phylum, stat="identity")) +
+  facet_wrap(~Treatment) +
+  scale_fill_manual(values=col_pJ) +
+  labs(title = "Relative Abundance of Phyla Over Time - Juvenile",
+       x = "Timepoint",
+       y = "Relative Abundance (%)",
+       fill = "Phylum") +
+  theme_minimal() +
+  scale_x_continuous(breaks=phyl_summary_juv$Timepoint) +
+  theme(legend.text = element_text(face="italic"))+ 
+  theme(legend.title=element_text(face="bold"), legend.position = "bottom") +
+  theme(plot.title = element_text(face="bold",hjust=0.5))
+
+
+#family 
+
+fam_summary_juv$Family[fam_summary_juv$mean < 2] <- "Others"
+
+fam_summary_juv$Family <- factor(fam_summary_juv$Family)
+ 
+
+fam_summary_juv$Timepoint <- as.numeric(gsub("t","", fam_summary_juv$Timepoint))
+
+fam_summary_juv <- fam_summary_juv %>%
+  ungroup() %>%
+  drop_na() %>%
+  complete(Family, Timepoint, Treatment, fill = list("mean"= 0))
+
+family_areaJ <- ggplot(fam_summary_juv) +
+  geom_area(aes(x = Timepoint, y = mean, fill = Family, stat="identity")) +
+  facet_wrap(~Treatment) +
+  scale_fill_manual(values=col_fJ) +
+  labs(title = "Relative Abundance of bacterial families over time - Juvenile",
+       x = "Timepoint",
+       y = "Relative Abundance (%)",
+       fill = "Family") +
+  theme_minimal() +
+  scale_x_continuous(breaks=fam_summary_juv$Timepoint) +
+  theme(legend.text = element_text(face="italic"))+ 
+  theme(legend.title=element_text(face="bold"), legend.position = "bottom") +
+  theme(plot.title = element_text(face="bold",hjust=0.5))
+
+#genus
+ 
+genus2J <- ps_juv1 %>%
+  transform_sample_counts(function(x) 100*x/sum(x)) %>%
+  tax_glom("Genus")
+
+top35 <- names(sort(taxa_sums(genus2J), decreasing = TRUE))[1:35]#select top35
+gen_subJ <- prune_taxa(top35, genus2J) %>%
+  psmelt()
+
+gen_subJ$Genus <- factor(gen_subJ$Genus)
+
+gen_subJ$Timepoint <- as.numeric(gsub("t","", gen_subJ$Timepoint))
+
+gen_subJ <- gen_subJ %>%
+  group_by(Genus, Treatment, Timepoint) %>%
+  summarise(mean=mean(Abundance), n=n()) %>%
+  ungroup() %>%
+  drop_na() %>%
+  complete(Genus, Timepoint, Treatment, fill = list("mean"= 0))
+
+genus_areaJ <- ggplot(gen_subJ) +
+  geom_area(aes(x = Timepoint, y = mean, fill = Genus, stat="identity")) +
+  facet_wrap(~Treatment) +
+  scale_fill_manual(values=col_gJ) +
+  labs(title = "Relative Abundance of top 30 abundant genera over time - Juvenile",
+       x = "Timepoint",
+       y = "Relative Abundance (%)",
+       fill = "Genus") +
+  theme_minimal() +
+  scale_x_continuous(breaks=gen_subA$Timepoint) +
+  theme(legend.text = element_text(face="italic"))+ 
+  theme(legend.title=element_text(face="bold"), legend.position = "bottom") +
+  theme(plot.title = element_text(face="bold",hjust=0.5))
+
+#plot on full dataset
+#phylum
+
+phyl_summary_all$Phylum[phyl_summary_all$mean < 1] <- "Others"
+
+col_Pall <- c("Proteobacteria" = "#89BF71", 
+           "Bacteroidota" = "#95C7F6", 
+           "Firmicutes" = "#C19BD2", 
+           "unclassified" = "#f4a34e", 
+           "Actinobacteriota" = "#5091CB",
+          "Myxococcota" = "#54863f", 
+           "Chloroflexi" = "#8571B8", 
+           "Fusobacteriota" = "#E06A6A", 
+           "Others" = "#906179",
+           "Spirochaetota" = "#a9a9a9"
+           )
+
+phyl_summary_all$Timepoint <- as.numeric(gsub("t","", phyl_summary_all$Timepoint))
+
+phyl_summary_all <- phyl_summary_all %>%
+  ungroup() %>%
+  drop_na() %>%
+  complete(Phylum, Timepoint, Treatment, fill = list("mean"= 0))
+
+phyl_summary_all <- phyl_summary_all %>% drop_na()
+
+phyl_summary_all$Treatment <- factor(phyl_summary_all$Treatment, levels=c("Control", "Florfenicol", "Mixture", "PAA"))
+
+
+#plot
+phylum_area_full <- ggplot(phyl_summary_all) +
+  geom_area(aes(x = Timepoint, y = mean, fill = Phylum)) +
+  scale_fill_manual(values=col_Pall) +
+  labs(x = "Timepoint",
+       y = "Relative Abundance (%)",
+       fill = "Phylum") +
+  scale_x_continuous(breaks=phyl_summary_all$Timepoint) +
+  theme(legend.text = element_text(face="italic", family="Arial", color="black"))+ 
+  theme(legend.title=element_text(face="bold", family="Arial", color="black"), legend.position = "right") +
+  theme(
+    axis.text.y = element_text(family = "Arial", color = "black"),
+    axis.text.x = element_text(family = "Arial", color = "black"), 
+    axis.title = element_text(family = "Arial", color = "black"), 
+    strip.text = element_text(family = "Arial", color = "black")) +
+  facet_grid(Age ~ Treatment)
+
+#control group only for panel plot
+
+phyl_summary_con$Phylum[phyl_summary_con$mean < 1] <- "Others"
+
+col_Pall <- c("Proteobacteria" = "#89BF71", 
+           "Bacteroidota" = "#95C7F6", 
+           "Firmicutes" = "#C19BD2", 
+           "unclassified" = "#f4a34e", 
+           "Actinobacteriota" = "#5091CB",
+          "Myxococcota" = "#54863f", 
+           "Chloroflexi" = "#8571B8", 
+           "Fusobacteriota" = "#E06A6A", 
+           "Others" = "#906179",
+           "Spirochaetota" = "#a9a9a9"
+           )
+
+phyl_summary_con$Timepoint <- as.numeric(gsub("t","", phyl_summary_con$Timepoint))
+
+phyl_summary_con <- phyl_summary_con %>%
+  ungroup() %>%
+  drop_na() %>%
+  complete(Phylum, Timepoint, fill = list("mean"= 0))
+
+phyl_summary_con <- phyl_summary_con %>% drop_na()
+
+#plot
+phylum_area_con <- ggplot(phyl_summary_con) +
+  geom_area(aes(x = Timepoint, y = mean, fill = Phylum)) +
+  scale_fill_manual(values=col_Pall) +
+  labs(x = "Timepoint",
+       y = "Relative Abundance (%)",
+       fill = "Phylum") +
+  scale_x_continuous(breaks=phyl_summary_con$Timepoint) +
+  theme(legend.text = element_text(face="italic", family="Arial", color="black"))+ 
+  theme(legend.title=element_text(face="bold", family="Arial", color="black"), legend.position = "bottom") +
+  theme(
+    axis.text.y = element_text(family = "Arial", color = "black"),
+    axis.text.x = element_text(family = "Arial", color = "black"), 
+    axis.title = element_text(family = "Arial", color = "black"), 
+    strip.text = element_text(family = "Arial", color = "black")) +
+  facet_grid(. ~ Age)
+
+
+#genus level
+
+genus_all <- ps_CSS %>%
+  transform_sample_counts(function(x) 100*x/sum(x)) %>%
+  tax_glom("Genus")
+
+top35 <- names(sort(taxa_sums(genus_all), decreasing = TRUE))[1:35]#select top35
+gen_sub <- prune_taxa(top35, genus_all) %>%
+  psmelt()
+
+
+gen_sub$Genus <- as.factor(gen_sub$Genus)
+length(table(gen_sub$Genus))
+nb.cols <- 31
+col_gJ <- colorRampPalette(brewer.pal(12, "Paired"))(nb.cols)
+names(col_gJ) <- levels(gen_subJ$Genus)
+col_gJ 
+
+col_g <- c("Acinetobacter" =  "#A6CEE3", "Aeromonas"="#74AED1" , "Bacteroides" = "#438EC0", "Brevundimonas" = "#2D82AF", "Candidatus Profftella"= "#63A8A0", "Cetobacterium" = "#99CD91", "Chryseobacterium"="#98D277" , "Crenobacter"="#6E9E4C", "Clostridium sensu stricto 1" = "#3677B2", "Corynebacterium" = "#BCBCBC","Deefgea"="#B89B74", "Falsiporphyromonas"="#FA9594", "Flavobacterium" = "#F16667", "Fusobacterium" = "#E62F27", "Hydrogenophaga" = "#F06C45", "Lactococcus" = "#F9A963", "Pantoea" = "#FE982C", "Paracoccus" = "#FE8103", "Photobacterium" = "#ED8F47", "Pseudomonas" = "#D9A295", "Pseudorhodobacter" = "#C3AAD2", "Rhodoferax" = "#A07FBC", "Shewanella" = "#7D54A5", "Sphaerotilus" = "#825D99", "Sphingomonas" = "#BC6060", "Sphingorhabdus" = "#B9A499", "Stenotrophomonas" = "#F0EB99", "Streptococcus" = "#EAD27A", "unclassified" = "#CD9551",  "Sutterella" = "#4b4b4b", "Veillonella" = "#B15928")
+
+        
+gen_sub$Timepoint <- as.numeric(gsub("t","", gen_sub$Timepoint))
+
+gen_sub <- gen_sub %>%
+  group_by(Genus, Treatment, Timepoint, Age) %>%
+  summarise(mean=mean(Abundance), n=n()) %>%
+  ungroup() %>%
+  drop_na() %>%
+  complete(Genus, Timepoint, Treatment, fill = list("mean"= 0))
+
+gen_area_full <- ggplot(gen_sub) +
+  geom_area(aes(x = Timepoint, y = mean, fill = Genus)) +
+  scale_fill_manual(values=col_g) +
+  labs(x = "Timepoint",
+       y = "Relative Abundance (%)",
+       fill = "Genus") +
+  theme_classic() +
+  scale_x_continuous(breaks=gen_sub$Timepoint) +
+  theme(legend.text = element_text(face="italic", family="Arial", color="black"))+ 
+  theme(legend.title=element_text(face="bold", family="Arial", color="black"), legend.position = "right") +
+  theme(
+    axis.text.y = element_text(family = "Arial", color = "black"),
+    axis.text.x = element_text(family = "Arial", color = "black"), 
+    axis.title = element_text(family = "Arial", color = "black"), 
+    strip.text = element_text(family = "Arial", color = "black")) +
+  facet_grid(Age ~ Treatment)
+
+#genus level - control only
+
+genus_con <- ps_CSS %>%
+  transform_sample_counts(function(x) 100*x/sum(x)) %>%
+  tax_glom("Genus") %>%
+  subset_samples(Treatment == "Control")
+
+top35 <- names(sort(taxa_sums(genus_con), decreasing = TRUE))[1:35]#select top35
+gen_sub <- prune_taxa(top35, genus_con) %>%
+  psmelt()
+
+gen_sub$Genus <- as.factor(gen_sub$Genus)
+
+gen_sub$Timepoint <- as.numeric(gsub("t","", gen_sub$Timepoint))
+
+gen_sub <- gen_sub %>%
+  group_by(Genus, Timepoint, Age) %>%
+  summarise(mean=mean(Abundance), n=n()) %>%
+  ungroup() %>%
+  drop_na() %>%
+  complete(Genus, Timepoint,  fill = list("mean"= 0))
+
+gen_area_con <- ggplot(gen_sub) +
+  geom_area(aes(x = Timepoint, y = mean, fill = Genus)) +
+  scale_fill_manual(values=col_g) +
+  labs(x = "Timepoint",
+       y = "Relative Abundance (%)",
+       fill = "Genus") +
+  scale_x_continuous(breaks=gen_sub$Timepoint) +
+  theme(legend.text = element_text(face="italic", family="Arial", color="black"))+ 
+  theme(legend.title=element_text(face="bold", family="Arial", color="black"), legend.position = "bottom") +
+  theme(
+    axis.text.y = element_text(family = "Arial", color = "black"),
+    axis.text.x = element_text(family = "Arial", color = "black"), 
+    axis.title = element_text(family = "Arial", color = "black"), 
+    strip.text = element_text(family = "Arial", color = "black")) +
+  facet_grid(. ~ Age)
+
+
+#aggreated plots (based on single plots per group)
+
+phylum <- ggarrange(phylum_area, phylum_areaJ, ncol=2, nrow=1, labels="auto", common.legend = TRUE, legend="bottom")
+family <- ggarrange(family_area, family_areaJ, ncol=2, nrow=1, labels="auto", common.legend=FALSE, legend="bottom")
+genus <- ggarrange(genus_area, genus_areaJ, ncol=2, nrow=1, labels="auto", common.legend=FALSE, legend="bottom")
+
+#control group - this was used for final publication
+
+control_area <- ggarrange(phylum_area_con, gen_area_con, ncol=2, nrow=1, align="hv", labels="auto", common.legend=FALSE)
+
+control_panel <- ggarrange(nmds_con,
+                           ggarrange(phylum_area_con, gen_area_con, nrow=2, align="hv", labels=c("b", "c")),
+                           ncol=2,
+                           labels="a"
+)
+
+control_panel2 <- ggarrange(nmds_con,
+                           ggarrange(phylum_area_con, gen_area_con, ncol=2, align="hv", labels=c("b", "c")),
+                           nrow=2,
+                           labels="a"
+)
+
+```
+
+### Core Microbiome 
+
+#### Calcutation of core ASVs
+
+```{r core, echo = TRUE, eval=T, message = F, error = F, warning = F}
+
+#calculation of core ASVs in the control groups
+#juvenile
+
+ps_juv <- subset_samples(ps_CSS, Age == "Juvenile")
+ps_juv_rel <- microbiome::transform(ps_juv, transform="compositional")
+ps_juv_rel <- microbiome::add_besthit(ps_juv_rel)
+ps_juv_con <- subset_samples(ps_juv_rel, Treatment == "Control")
+ps_juv_con_filt <- subset_taxa(ps_juv_con, Class != "unclassified")
+Con_coreJ <- core(ps_juv_con_filt, detection = 0.0001, prevalence = 70/100)
+
+#adult
+
+ps_ad <- subset_samples(ps_CSS, Age == "Adult")
+ps_ad_rel <- microbiome::transform(ps_ad, transform="compositional")
+ps_ad_rel <- microbiome::add_besthit(ps_ad_rel)
+ps_ad_con <- subset_samples(ps_ad_rel, Treatment == "Control")
+ps_ad_con_filt <- subset_taxa(ps_ad_con, Class != "unclassified")
+Con_coreA <- core(ps_ad_con_filt, detection = 0.0001, prevalence = 70/100)
+
+
+
+```
+
+#### Core visualization
+
+```{r core_viz, echo = T, eval = T, message = F, error = F, warning = F}
+
+#using implemented heatmap function from microbiome
+
+# Core with compositionals:
+prevalences <- seq(.05, 1, .05)
+detections <- round(10^seq(log10(1e-3), log10(.2), length = 10), 3)
+
+#Deletes "ASV" from taxa_names, e.g. ASV1 --> 1
+#taxa_names(ps.m3.rel) = taxa_names(ps.m3.rel) %>% str_replace("ASV", "")
+# Also define gray color palette
+
+coreheat_juv <- plot_core(Con_coreJ,
+  plot.type = "heatmap",
+  colours = rev(brewer.pal(5, "RdBu")),
+  prevalences = prevalences,
+  detections = detections, min.prevalence = .0001) +
+  xlab("Detection Threshold (Relative Abundance (%))") +  theme(
+    axis.text.y = element_text(face = "italic", family = "Arial", color = "black",size=16),
+    axis.text.x = element_text(family = "Arial", color = "black"), 
+    axis.title = element_text(family = "Arial", color = "black"),    
+    legend.text = element_text(family = "Arial", color = "black"),
+    legend.title = element_text(family = "Arial", color = "black", face="bold"))
+
+
+
+coreheat_ad <- plot_core(Con_coreA,
+  plot.type = "heatmap",
+  colours = rev(brewer.pal(5, "RdBu")),
+  prevalences = prevalences,
+  detections = detections, min.prevalence = .0001) +
+  xlab("Detection Threshold (Relative Abundance (%))") +
+  theme(
+    axis.text.y = element_text(face = "italic", family = "Arial", color = "black",size=16),
+    axis.text.x = element_text(family = "Arial", color = "black"), 
+    axis.title = element_text(family = "Arial", color = "black"),    
+    legend.text = element_text(family = "Arial", color = "black"),
+    legend.title = element_text(family = "Arial", color = "black", face="bold"))
+
+
+#core control panel - this was used for final publication
+
+core_panel <- ggarrange(coreheat_ad, coreheat_juv, ncol=2, nrow=1, labels="auto", align="hv", common.legend = TRUE, legend="right")
+
+
+
+```
+
+### Differential Abundance Testing
+
+used to indentify microbial key resonders to the different treatment
+
+```{r deseq2, echo = T, eval = T, warning = F, error = F, message = F}
+
+#set seed for reproducibility
+set.seed(713)
+
+#convert the phyloseq object into a DESeq2 object
+##we want to include the major factors for the dataset: Treatment and Timepoint. 
+##note: variable of interest should be at the last position in the design formula
+
+#start with full model for juvenile
+
+dds_juv <- phyloseq_to_deseq2(ps_juv, ~ Timepoint + Treatment + Timepoint:Treatment)
+dds_juv$Treatment <- relevel(dds_juv$Treatment, ref="Control")
+dds_juv$Timepoint <- relevel(dds_juv$Timepoint, ref="t0")
+
+#run DESeq
+#i followed the recommendations of the DESeq2 vignette -> LRT is recommended for testing multiple terms with 3 or more levels of a factor at once.
+#all other settings were kept as default expect for the fitType, since the curve doesn't fit the observed dispersion. 
+gm_mean = function(x, na.rm=TRUE){
+  exp(sum(log(x[x > 0]), na.rm=na.rm) / length(x))
+}
+geoMeans = apply(counts(dds_juv), 1, gm_mean)
+dds_juv <- estimateSizeFactors(dds_juv, geoMeans = geoMeans)
+dds_juv <- DESeq(dds_juv, test = "LRT", full = ~ Timepoint + Treatment + Timepoint:Treatment, reduced = ~ Treatment, fitType = "local")
+
+plotDispEsts(dds_juv)
+
+resultsNames(dds_juv)
+alpha = 0.05
+
+#extract results from full model (seems to be the more reliable option)
+#start with t10
+
+resFF_t10 <- results(dds_juv, contrast=list(c("Treatment_Florfenicol_vs_Control", "Timepointt10.TreatmentFlorfenicol")), alpha=alpha)
+summary(resFF_t10)
+resFF_t10 <- subset(resFF_t10, padj < 0.05)
+resFF_t10 <- data.frame(resFF_t10)
+resFF_t10 <- merge(resFF_t10, taxa, by=0) #add taxa names
+t10FF <- resFF_t10[(resFF_t10$log2FoldChange <= -1) | (resFF_t10$log2FoldChange >=1),]
+
+#to control if there are some false positives
+FF_da_tax <- t10FF$Row.names
+
+psFF_t10 <- prune_taxa(taxa_names(ps_juv_rel) %in% FF_da_tax, ps_juv_rel)
+psFF_t10 <- psmelt(psFF_t10)
+DAFF_t10 <- ggplot(psFF_t10, aes(x = Timepoint, y = Abundance, col=Treatment))+geom_boxplot() + facet_wrap(~ OTU, scales="free") + scale_color_manual(values=treatment)
+
+#Mixture
+
+resMix_t10 <- results(dds_juv, contrast=list(c("Treatment_Mixture_vs_Control", "Timepointt10.TreatmentMixture")), alpha=alpha)
+summary(resMix_t10)
+resMix_t10 <- subset(resMix_t10, padj < 0.05)
+resMix_t10 <- data.frame(resMix_t10)
+resMix_t10 <- merge(resMix_t10, taxa, by=0) #add taxa names
+t10Mix <- resMix_t10[(resMix_t10$log2FoldChange <= -1) | (resMix_t10$log2FoldChange >=1),]
+
+#to control if there are some false positives
+Mix_da_tax <- t10Mix$Row.names
+
+psMix_t10 <- prune_taxa(taxa_names(ps_juv_rel) %in% Mix_da_tax, ps_juv_rel)
+psMix_t10 <- psmelt(psMix_t10)
+DAMix_t10 <- ggplot(psMix_t10, aes(x = Timepoint, y = Abundance, col=Treatment))+geom_boxplot() + facet_wrap(~ OTU, scales="free") + scale_color_manual(values=treatment)
+
+#PAA
+
+resPAA_t10 <- results(dds_juv, contrast=list(c("Treatment_PAA_vs_Control", "Timepointt10.TreatmentPAA")), alpha=alpha)
+summary(resPAA_t10)
+resPAA_t10 <- subset(resPAA_t10, padj < 0.05)
+resPAA_t10 <- data.frame(resPAA_t10)
+resPAA_t10 <- merge(resPAA_t10, taxa, by=0) #add taxa names
+t10PAA <- resPAA_t10[(resPAA_t10$log2FoldChange <= -1) | (resPAA_t10$log2FoldChange >=1),]
+
+#to control if there are some false positives
+PAA_da_tax <- t10PAA$Row.names
+
+psPAA_t10 <- prune_taxa(taxa_names(ps_juv_rel) %in% PAA_da_tax, ps_juv_rel)
+psPAA_t10 <- psmelt(psPAA_t10)
+DAPAA_t10 <- ggplot(psPAA_t10, aes(x = Timepoint, y = Abundance, col=Treatment))+geom_boxplot() + facet_wrap(~ OTU, scales="free") + scale_color_manual(values=treatment)
+
+
+#for plotting, all diff. abundant asv of all three treatments must be combined into one data.frame with an additional column called treatment.
+#add treatment column
+Treatment <- "Florfenicol"
+Treatment <- rep(Treatment, 35)
+t10FF$Treatment <- Treatment
+
+Treatment <- "Mixture"
+Treatment <- rep(Treatment, 36)
+t10Mix$Treatment <- Treatment
+
+Treatment <- "PAA"
+Treatment <- rep(Treatment, 35)
+t10PAA$Treatment <- Treatment
+
+t10_effect <- rbind(t10FF, t10Mix, t10PAA)
+Timepoint <- "t10"
+Timepoint <- rep(Timepoint, 106)
+t10_effect$Timepoint <- Timepoint
+
+#modify label column -> combine family & genus
+cols <- c("Phylum", "Family", "Genus", "Row.names")
+t10_effect$Label <- apply(t10_effect[, cols], 1, paste, collapse=";")
+
+#repeat for t14
+
+resFF_t14 <- results(dds_juv, contrast=list(c("Treatment_Florfenicol_vs_Control", "Timepointt14.TreatmentFlorfenicol")), alpha=alpha)
+summary(resFF_t14)
+resFF_t14 <- subset(resFF_t14, padj < 0.05)
+resFF_t14 <- data.frame(resFF_t14)
+resFF_t14 <- merge(resFF_t14, taxa, by=0) #add taxa names
+t14FF <- resFF_t14[(resFF_t14$log2FoldChange <= -1) | (resFF_t14$log2FoldChange >=1),]
+
+#to control if there are some false positives
+FF14_da_tax <- t14FF$Row.names
+setdiff(FF14_da_tax, FF_da_tax) 
+#"ASV114" "ASV12"  "ASV17"  "ASV212" "ASV223" "ASV231" "ASV267" "ASV27"  "ASV36"  "ASV58"  "ASV64" 
+
+psFF_t14 <- prune_taxa(taxa_names(ps_juv_rel) %in% FF14_da_tax, ps_juv_rel)
+psFF_t14 <- psmelt(psFF_t14)
+DAFF_t14 <- ggplot(psFF_t14, aes(x = Timepoint, y = Abundance, col=Treatment))+geom_boxplot() + facet_wrap(~ OTU, scales="free") + scale_color_manual(values=treatment)
+
+#Mixture
+
+resMix_t14 <- results(dds_juv, contrast=list(c("Treatment_Mixture_vs_Control", "Timepointt14.TreatmentMixture")), alpha=alpha)
+summary(resMix_t14)
+resMix_t14 <- subset(resMix_t14, padj < 0.05)
+resMix_t14 <- data.frame(resMix_t14)
+resMix_t14 <- merge(resMix_t14, taxa, by=0) #add taxa names
+t14Mix <- resMix_t14[(resMix_t14$log2FoldChange <= -1) | (resMix_t14$log2FoldChange >=1),]
+
+#to control if there are some false positives
+Mix14_da_tax <- t14Mix$Row.names
+setdiff(Mix14_da_tax, Mix_da_tax)
+#"ASV101" "ASV146" "ASV223" "ASV231" "ASV248" "ASV267" "ASV30"  "ASV36"  "ASV402" "ASV58"
+
+psMix_t14 <- prune_taxa(taxa_names(ps_juv_rel) %in% Mix14_da_tax, ps_juv_rel)
+psMix_t14 <- psmelt(psMix_t14)
+DAMix_t14 <- ggplot(psMix_t14, aes(x = Timepoint, y = Abundance, col=Treatment))+geom_boxplot() + facet_wrap(~ OTU, scales="free") + scale_color_manual(values=treatment)
+
+#PAA
+
+resPAA_t14 <- results(dds_juv, contrast=list(c("Treatment_PAA_vs_Control", "Timepointt14.TreatmentPAA")), alpha=alpha)
+summary(resPAA_t14)
+resPAA_t14 <- subset(resPAA_t14, padj < 0.05)
+resPAA_t14 <- data.frame(resPAA_t14)
+resPAA_t14 <- merge(resPAA_t14, taxa, by=0) #add taxa names
+t14PAA <- resPAA_t14[(resPAA_t14$log2FoldChange <= -1) | (resPAA_t14$log2FoldChange >=1),]
+
+#to control if there are some false positives
+PAA14_da_tax <- t14PAA$Row.names
+setdiff(PAA14_da_tax, PAA_da_tax)
+#"ASV144" "ASV159" "ASV17"  "ASV223" "ASV231" "ASV248" "ASV267" "ASV30"  "ASV36"  "ASV402" "ASV51"  "ASV84" 
+
+psPAA_t14 <- prune_taxa(taxa_names(ps_juv_rel) %in% PAA14_da_tax, ps_juv_rel)
+psPAA_t14 <- psmelt(psPAA_t14)
+DAPAA_t14 <- ggplot(psPAA_t14, aes(x = Timepoint, y = Abundance, col=Treatment))+geom_boxplot() + facet_wrap(~ OTU, scales="free") + scale_color_manual(values=treatment)
+
+
+#for plotting, all diff. abundant asv of all three treatments must be combined into one data.frame with an additional column called treatment.
+#add treatment column
+Treatment <- "Florfenicol"
+Treatment <- rep(Treatment, 40)
+t14FF$Treatment <- Treatment
+
+Treatment <- "Mixture"
+Treatment <- rep(Treatment, 42)
+t14Mix$Treatment <- Treatment
+
+Treatment <- "PAA"
+Treatment <- rep(Treatment, 44)
+t14PAA$Treatment <- Treatment
+
+t14_effect <- rbind(t14FF, t14Mix, t14PAA)
+Timepoint <- "t14"
+Timepoint <- rep(Timepoint, 126)
+t14_effect$Timepoint <- Timepoint
+
+#modify label column -> combine family & genus
+cols <- c("Phylum", "Family", "Genus", "Row.names")
+t14_effect$Label <- apply(t14_effect[, cols], 1, paste, collapse=";")
+
+#repeat t21
+
+resFF_t21 <- results(dds_juv, contrast=list(c("Treatment_Florfenicol_vs_Control", "Timepointt21.TreatmentFlorfenicol")), alpha=alpha)
+summary(resFF_t21)
+resFF_t21 <- subset(resFF_t21, padj < 0.05)
+resFF_t21 <- data.frame(resFF_t21)
+resFF_t21 <- merge(resFF_t21, taxa, by=0) #add taxa names
+t21FF <- resFF_t21[(resFF_t21$log2FoldChange <= -1) | (resFF_t21$log2FoldChange >=1),]
+
+#to control if there are some false positives
+FF21_da_tax <- t21FF$Row.names
+
+psFF_t21 <- prune_taxa(taxa_names(ps_juv_rel) %in% FF21_da_tax, ps_juv_rel)
+psFF_t21 <- psmelt(psFF_t21)
+DAFF_t21 <- ggplot(psFF_t21, aes(x = Timepoint, y = Abundance, col=Treatment))+geom_boxplot() + facet_wrap(~ OTU, scales="free") + scale_color_manual(values=treatment)
+
+#Mixture
+
+resMix_t21 <- results(dds_juv, contrast=list(c("Treatment_Mixture_vs_Control", "Timepointt21.TreatmentMixture")), alpha=alpha)
+summary(resMix_t21)
+resMix_t21 <- subset(resMix_t21, padj < 0.05)
+resMix_t21 <- data.frame(resMix_t21)
+resMix_t21 <- merge(resMix_t21, taxa, by=0) #add taxa names
+t21Mix <- resMix_t21[(resMix_t21$log2FoldChange <= -1) | (resMix_t21$log2FoldChange >=1),]
+
+#to control if there are some false positives
+Mix21_da_tax <- t21Mix$Row.names
+setdiff(Mix21_da_tax, Mix_da_tax)
+#"ASV101" "ASV12"  "ASV146" "ASV223" "ASV231" "ASV248" "ASV267" "ASV30"  "ASV36"  "ASV58"
+
+psMix_t21 <- prune_taxa(taxa_names(ps_juv_rel) %in% Mix21_da_tax, ps_juv_rel)
+psMix_t21 <- psmelt(psMix_t21)
+DAMix_t21 <- ggplot(psMix_t21, aes(x = Timepoint, y = Abundance, col=Treatment))+geom_boxplot() + facet_wrap(~ OTU, scales="free") + scale_color_manual(values=treatment)
+
+#PAA
+
+resPAA_t21 <- results(dds_juv, contrast=list(c("Treatment_PAA_vs_Control", "Timepointt21.TreatmentPAA")), alpha=alpha)
+summary(resPAA_t21)
+resPAA_t21 <- subset(resPAA_t21, padj < 0.05)
+resPAA_t21 <- data.frame(resPAA_t21)
+resPAA_t21 <- merge(resPAA_t21, taxa, by=0) #add taxa names
+t21PAA <- resPAA_t21[(resPAA_t21$log2FoldChange <= -1) | (resPAA_t21$log2FoldChange >=1),]
+
+#to control if there are some false positives
+PAA21_da_tax <- t21PAA$Row.names
+setdiff(PAA21_da_tax, PAA_da_tax)
+#"ASV1"   "ASV116" "ASV144" "ASV146" "ASV159" "ASV17"  "ASV223" "ASV248" "ASV267" "ASV30"  "ASV36"  "ASV402" "ASV51"  "ASV84"
+
+psPAA_t21 <- prune_taxa(taxa_names(ps_juv_rel) %in% PAA21_da_tax, ps_juv_rel)
+psPAA_t21 <- psmelt(psPAA_t21)
+DAPAA_t21 <- ggplot(psPAA_t21, aes(x = Timepoint, y = Abundance, col=Treatment))+geom_boxplot() + facet_wrap(~ OTU, scales="free") + scale_color_manual(values=treatment)
+
+
+#for plotting, all diff. abundant asv of all three treatments must be combined into one data.frame with an additional column called treatment.
+#add treatment column
+Treatment <- "Florfenicol"
+Treatment <- rep(Treatment, 23)
+t21FF$Treatment <- Treatment
+
+Treatment <- "Mixture"
+Treatment <- rep(Treatment, 53)
+t21Mix$Treatment <- Treatment
+
+Treatment <- "PAA"
+Treatment <- rep(Treatment, 51)
+t21PAA$Treatment <- Treatment
+
+t21_effect <- rbind(t21FF, t21Mix, t21PAA)
+Timepoint <- "t21"
+Timepoint <- rep(Timepoint, 127)
+t21_effect$Timepoint <- Timepoint
+
+#modify label column -> combine family & genus
+cols <- c("Phylum", "Family", "Genus", "Row.names")
+t21_effect$Label <- apply(t21_effect[, cols], 1, paste, collapse=";")
+
+#repeat for t28
+
+resFF_t28 <- results(dds_juv, contrast=list(c("Treatment_Florfenicol_vs_Control", "Timepointt28.TreatmentFlorfenicol")), alpha=alpha)
+summary(resFF_t28)
+resFF_t28 <- subset(resFF_t28, padj < 0.05)
+resFF_t28 <- data.frame(resFF_t28)
+resFF_t28 <- merge(resFF_t28, taxa, by=0) #add taxa names
+t28FF <- resFF_t28[(resFF_t28$log2FoldChange <= -1) | (resFF_t28$log2FoldChange >=1),]
+
+#to control if there are some false positives
+FF28_da_tax <- t28FF$Row.names
+setdiff(FF28_da_tax, FF_da_tax)
+#"ASV146" "ASV212" "ASV223" "ASV267" "ASV64" 
+
+psFF_t28 <- prune_taxa(taxa_names(ps_juv_rel) %in% FF28_da_tax, ps_juv_rel)
+psFF_t28 <- psmelt(psFF_t28)
+DAFF_t28 <- ggplot(psFF_t28, aes(x = Timepoint, y = Abundance, col=Treatment))+geom_boxplot() + facet_wrap(~ OTU, scales="free") + scale_color_manual(values=treatment)
+
+#Mixture
+
+resMix_t28 <- results(dds_juv, contrast=list(c("Treatment_Mixture_vs_Control", "Timepointt28.TreatmentMixture")), alpha=alpha)
+summary(resMix_t28)
+resMix_t28 <- subset(resMix_t28, padj < 0.05)
+resMix_t28 <- data.frame(resMix_t28)
+resMix_t28 <- merge(resMix_t28, taxa, by=0) #add taxa names
+t28Mix <- resMix_t28[(resMix_t28$log2FoldChange <= -1) | (resMix_t28$log2FoldChange >=1),]
+
+#to control if there are some false positives
+Mix28_da_tax <- t28Mix$Row.names
+setdiff(Mix28_da_tax, Mix_da_tax)
+#"ASV101" "ASV267" "ASV402"
+
+psMix_t28 <- prune_taxa(taxa_names(ps_juv_rel) %in% Mix28_da_tax, ps_juv_rel)
+psMix_t28 <- psmelt(psMix_t28)
+DAMix_t28 <- ggplot(psMix_t28, aes(x = Timepoint, y = Abundance, col=Treatment))+geom_boxplot() + facet_wrap(~ OTU, scales="free") + scale_color_manual(values=treatment)
+
+#PAA
+
+resPAA_t28 <- results(dds_juv, contrast=list(c("Treatment_PAA_vs_Control", "Timepointt28.TreatmentPAA")), alpha=alpha)
+summary(resPAA_t28)
+resPAA_t28 <- subset(resPAA_t28, padj < 0.05)
+resPAA_t28 <- data.frame(resPAA_t28)
+resPAA_t28 <- merge(resPAA_t28, taxa, by=0) #add taxa names
+t28PAA <- resPAA_t28[(resPAA_t28$log2FoldChange <= -1) | (resPAA_t28$log2FoldChange >=1),]
+
+#to control if there are some false positives
+PAA28_da_tax <- t28PAA$Row.names
+setdiff(PAA28_da_tax, PAA_da_tax)
+#"ASV1"   "ASV116" "ASV144" "ASV248" "ASV402" "ASV84"
+
+psPAA_t28 <- prune_taxa(taxa_names(ps_juv_rel) %in% PAA28_da_tax, ps_juv_rel)
+psPAA_t28 <- psmelt(psPAA_t28)
+DAPAA_t28 <- ggplot(psPAA_t28, aes(x = Timepoint, y = Abundance, col=Treatment))+geom_boxplot() + facet_wrap(~ OTU, scales="free") + scale_color_manual(values=treatment)
+
+
+#for plotting, all diff. abundant asv of all three treatments must be combined into one data.frame with an additional column called treatment.
+#add treatment column
+Treatment <- "Florfenicol"
+Treatment <- rep(Treatment, 25)
+t28FF$Treatment <- Treatment
+
+Treatment <- "Mixture"
+Treatment <- rep(Treatment, 17)
+t28Mix$Treatment <- Treatment
+
+Treatment <- "PAA"
+Treatment <- rep(Treatment, 30)
+t28PAA$Treatment <- Treatment
+
+t28_effect <- rbind(t28FF, t28Mix, t28PAA)
+Timepoint <- "t28"
+Timepoint <- rep(Timepoint, 72)
+t28_effect$Timepoint <- Timepoint
+
+#modify label column -> combine family & genus
+cols <- c("Phylum", "Family", "Genus", "Row.names")
+t28_effect$Label <- apply(t28_effect[, cols], 1, paste, collapse=";")
+
+#save full dataframe as excel
+full_effect <- rbind(t10_effect, t14_effect, t21_effect, t28_effect)
+write.xlsx(full_effect, file="04_reports/DiffAbundance_juvenile.xlsx", colNames=TRUE)
+
+#repeat for adult samples
+
+set.seed(713)
+
+#subset phyloseq objects and transform to relative abundance for the boxplots
+#not normalized
+ps_adult <- subset_samples(ps_sub, Age == "Adult")
+ps_adult_rel <- transform_sample_counts(ps_adult, function (x) 100*x/sum(x))
+
+##convert the phyloseq object into a DESeq2 object
+##we want to include the major factors for the dataset: Treatment and Timepoint. 
+##open questions: would it make sense to a) use Age as n interaction term for treatment, e.g. is the treatment effect dependent on the Age?
+##and/or: is the treatment effect dependent on time? 
+##+ DESeq2 also offers a time series option -> would this make sense?
+##note: variable of interest should be at the last position in the design formula
+
+#start with full model for adult - on genus level
+ps_adult <- subset_samples(ps_sub, Age == "Adult")
+ps_adult <- prune_taxa(taxa_sums(ps_adult) > 0, ps_adult)
+ps_adult_gen <- tax_glom(ps_adult, "Genus")
+dds_adult <- phyloseq_to_deseq2(ps_adult_gen, ~ Timepoint + Treatment + Timepoint:Treatment)
+dds_adult$Treatment <- relevel(dds_adult$Treatment, ref="Control")
+dds_adult$Timepoint <- relevel(dds_adult$Timepoint, ref="t0")
+
+#on asv level in comparison
+dds_adult <- phyloseq_to_deseq2(ps_adult, ~ Timepoint + Treatment + Timepoint:Treatment)
+dds_adult$Treatment <- relevel(dds_adult$Treatment, ref="Control")
+dds_adult$Timepoint <- relevel(dds_adult$Timepoint, ref="t0")
+#run DESeq
+#i followed the recommendations of the DESeq2 vignette -> LRT is recommended for testing multiple terms with 3 or more levels of a factor at once.
+#all other settings were kept as default expect for the fitType, since the curve doesn't fit the observed dispersion. 
+gm_mean = function(x, na.rm=TRUE){
+  exp(sum(log(x[x > 0]), na.rm=na.rm) / length(x))
+}
+geoMeans = apply(counts(dds_adult), 1, gm_mean)
+dds_adult <- estimateSizeFactors(dds_adult, geoMeans = geoMeans)
+dds_adult <- DESeq(dds_adult, test = "LRT", full = ~ Timepoint + Treatment + Timepoint:Treatment, reduced = ~ Treatment, fitType = "local")
+
+plotDispEsts(dds_adult)
+
+resultsNames(dds_adult)
+alpha = 0.05
+
+#extract results from full model (seems to be the more reliable option)
+#start with t10
+resFF_t10 <- results(dds_adult, contrast=list(c("Treatment_Florfenicol_vs_Control", "Timepointt10.TreatmentFlorfenicol")), alpha=alpha)
+summary(resFF_t10)
+resFF_t10 <- subset(resFF_t10, padj < 0.05)
+resFF_t10 <- data.frame(resFF_t10)
+resFF_t10 <- merge(resFF_t10, taxa, by=0) #add taxa names
+t10FFA <- resFF_t10[(resFF_t10$log2FoldChange <= -1) | (resFF_t10$log2FoldChange >=1),]
+
+#to control if there are some false positives
+FF_da_tax <- t10FFA$Row.names
+
+psFF_t10 <- prune_taxa(taxa_names(ps_adult_rel) %in% FF_da_tax, ps_adult_rel)
+psFF_t10 <- psmelt(psFF_t10)
+DAFF_t10 <- ggplot(psFF_t10, aes(x = Timepoint, y = Abundance, col=Treatment))+geom_boxplot() + facet_wrap(~ OTU, scales="free") + scale_color_manual(values=treatment)
+
+#Mixture
+
+resMix_t10 <- results(dds_adult, contrast=list(c("Treatment_Mixture_vs_Control", "Timepointt10.TreatmentMixture")), alpha=alpha)
+summary(resMix_t10)
+resMix_t10 <- subset(resMix_t10, padj < 0.05)
+resMix_t10 <- data.frame(resMix_t10)
+resMix_t10 <- merge(resMix_t10, taxa, by=0) #add taxa names
+t10Mix <- resMix_t10[(resMix_t10$log2FoldChange <= -1) | (resMix_t10$log2FoldChange >=1),]
+
+#to control if there are some false positives
+Mix_da_tax <- t10Mix$Row.names
+
+psMix_t10 <- prune_taxa(taxa_names(ps_adult_rel) %in% Mix_da_tax, ps_adult_rel)
+psMix_t10 <- psmelt(psMix_t10)
+DAMix_t10 <- ggplot(psMix_t10, aes(x = Timepoint, y = Abundance, col=Treatment))+geom_boxplot() + facet_wrap(~ OTU, scales="free") + scale_color_manual(values=treatment)
+
+#PAA
+
+resPAA_t10 <- results(dds_adult, contrast=list(c("Treatment_PAA_vs_Control", "Timepointt10.TreatmentPAA")), alpha=alpha)
+summary(resPAA_t10)
+resPAA_t10 <- subset(resPAA_t10, padj < 0.05)
+resPAA_t10 <- data.frame(resPAA_t10)
+resPAA_t10 <- merge(resPAA_t10, taxa, by=0) #add taxa names
+t10PAA <- resPAA_t10[(resPAA_t10$log2FoldChange <= -1) | (resPAA_t10$log2FoldChange >=1),]
+
+#to control if there are some false positives
+PAA_da_tax <- t10PAA$Row.names
+
+psPAA_t10 <- prune_taxa(taxa_names(ps_adult_rel) %in% PAA_da_tax, ps_adult_rel)
+psPAA_t10 <- psmelt(psPAA_t10)
+DAPAA_t10 <- ggplot(psPAA_t10, aes(x = Timepoint, y = Abundance, col=Treatment))+geom_boxplot() + facet_wrap(~ OTU, scales="free") + scale_color_manual(values=treatment)
+
+
+#for plotting, all diff. abundant asv of all three treatments must be combined into one data.frame with an additional column called treatment.
+#add treatment column
+Treatment <- "Florfenicol"
+Treatment <- rep(Treatment, 6)
+t10FFA$Treatment <- Treatment
+
+Treatment <- "Mixture"
+Treatment <- rep(Treatment, 8)
+t10Mix$Treatment <- Treatment
+
+Treatment <- "PAA"
+Treatment <- rep(Treatment, 9)
+t10PAA$Treatment <- Treatment
+
+t10_effect <- rbind(t10FFA, t10Mix, t10PAA)
+Timepoint <- "t10"
+Timepoint <- rep(Timepoint, 23)
+t10_effect$Timepoint <- Timepoint
+
+#modify label column -> combine family & genus
+cols <- c("Phylum", "Family", "Genus", "Row.names")
+t10_effect$Label <- apply(t10_effect[, cols], 1, paste, collapse=";")
+
+#repeat for t14
+
+resFF_t14 <- results(dds_adult, contrast=list(c("Treatment_Florfenicol_vs_Control", "Timepointt14.TreatmentFlorfenicol")), alpha=alpha)
+summary(resFF_t14)
+resFF_t14 <- subset(resFF_t14, padj < 0.05)
+resFF_t14 <- data.frame(resFF_t14)
+resFF_t14 <- merge(resFF_t14, taxa, by=0) #add taxa names
+t14FF <- resFF_t14[(resFF_t14$log2FoldChange <= -1) | (resFF_t14$log2FoldChange >=1),]
+
+#to control if there are some false positives
+FF14_da_tax <- t14FF$Row.names
+setdiff(FF14_da_tax, FF_da_tax) 
+#"ASV114" "ASV12"  "ASV17"  "ASV212" "ASV223" "ASV231" "ASV267" "ASV27"  "ASV36"  "ASV58"  "ASV64" 
+
+psFF_t14 <- prune_taxa(taxa_names(ps_adult_rel) %in% FF14_da_tax, ps_adult_rel)
+psFF_t14 <- psmelt(psFF_t14)
+DAFF_t14 <- ggplot(psFF_t14, aes(x = Timepoint, y = Abundance, col=Treatment))+geom_boxplot() + facet_wrap(~ OTU, scales="free") + scale_color_manual(values=treatment)
+
+#Mixture
+
+resMix_t14 <- results(dds_adult, contrast=list(c("Treatment_Mixture_vs_Control", "Timepointt14.TreatmentMixture")), alpha=alpha)
+summary(resMix_t14)
+resMix_t14 <- subset(resMix_t14, padj < 0.05)
+resMix_t14 <- data.frame(resMix_t14)
+resMix_t14 <- merge(resMix_t14, taxa, by=0) #add taxa names
+t14Mix <- resMix_t14[(resMix_t14$log2FoldChange <= -1) | (resMix_t14$log2FoldChange >=1),]
+
+#to control if there are some false positives
+Mix14_da_tax <- t14Mix$Row.names
+setdiff(Mix14_da_tax, Mix_da_tax)
+#"ASV101" "ASV146" "ASV223" "ASV231" "ASV248" "ASV267" "ASV30"  "ASV36"  "ASV402" "ASV58"
+
+psMix_t14 <- prune_taxa(taxa_names(ps_adult_rel) %in% Mix14_da_tax, ps_adult_rel)
+psMix_t14 <- psmelt(psMix_t14)
+DAMix_t14 <- ggplot(psMix_t14, aes(x = Timepoint, y = Abundance, col=Treatment))+geom_boxplot() + facet_wrap(~ OTU, scales="free") + scale_color_manual(values=treatment)
+
+#PAA
+
+resPAA_t14 <- results(dds_adult, contrast=list(c("Treatment_PAA_vs_Control", "Timepointt14.TreatmentPAA")), alpha=alpha)
+summary(resPAA_t14)
+resPAA_t14 <- subset(resPAA_t14, padj < 0.05)
+resPAA_t14 <- data.frame(resPAA_t14)
+resPAA_t14 <- merge(resPAA_t14, taxa, by=0) #add taxa names
+t14PAA <- resPAA_t14[(resPAA_t14$log2FoldChange <= -1) | (resPAA_t14$log2FoldChange >=1),]
+
+#to control if there are some false positives
+PAA14_da_tax <- t14PAA$Row.names
+setdiff(PAA14_da_tax, PAA_da_tax)
+#"ASV144" "ASV159" "ASV17"  "ASV223" "ASV231" "ASV248" "ASV267" "ASV30"  "ASV36"  "ASV402" "ASV51"  "ASV84" 
+
+psPAA_t14 <- prune_taxa(taxa_names(ps_adult_rel) %in% PAA14_da_tax, ps_adult_rel)
+psPAA_t14 <- psmelt(psPAA_t14)
+DAPAA_t14 <- ggplot(psPAA_t14, aes(x = Timepoint, y = Abundance, col=Treatment))+geom_boxplot() + facet_wrap(~ OTU, scales="free") + scale_color_manual(values=treatment)
+
+
+#for plotting, all diff. abundant asv of all three treatments must be combined into one data.frame with an additional column called treatment.
+#add treatment column
+Treatment <- "Florfenicol"
+Treatment <- rep(Treatment, 8)
+t14FF$Treatment <- Treatment
+
+Treatment <- "Mixture"
+Treatment <- rep(Treatment, 8)
+t14Mix$Treatment <- Treatment
+
+Treatment <- "PAA"
+Treatment <- rep(Treatment, 7)
+t14PAA$Treatment <- Treatment
+
+t14_effect <- rbind(t14FF, t14Mix, t14PAA)
+Timepoint <- "t14"
+Timepoint <- rep(Timepoint, 23)
+t14_effect$Timepoint <- Timepoint
+
+#modify label column -> combine family & genus
+cols <- c("Phylum", "Family", "Genus", "Row.names")
+t14_effect$Label <- apply(t14_effect[, cols], 1, paste, collapse=";")
+
+#repeat t21
+
+resFF_t21 <- results(dds_adult, contrast=list(c("Treatment_Florfenicol_vs_Control", "Timepointt21.TreatmentFlorfenicol")), alpha=alpha)
+summary(resFF_t21)
+resFF_t21 <- subset(resFF_t21, padj < 0.05)
+resFF_t21 <- data.frame(resFF_t21)
+resFF_t21 <- merge(resFF_t21, taxa, by=0) #add taxa names
+t21FF <- resFF_t21[(resFF_t21$log2FoldChange <= -1) | (resFF_t21$log2FoldChange >=1),]
+
+#to control if there are some false positives
+FF21_da_tax <- t21FF$Row.names
+
+psFF_t21 <- prune_taxa(taxa_names(ps_adult_rel) %in% FF21_da_tax, ps_adult_rel)
+psFF_t21 <- psmelt(psFF_t21)
+DAFF_t21 <- ggplot(psFF_t21, aes(x = Timepoint, y = Abundance, col=Treatment))+geom_boxplot() + facet_wrap(~ OTU, scales="free") + scale_color_manual(values=treatment)
+
+#Mixture
+
+resMix_t21 <- results(dds_adult, contrast=list(c("Treatment_Mixture_vs_Control", "Timepointt21.TreatmentMixture")), alpha=alpha)
+summary(resMix_t21)
+resMix_t21 <- subset(resMix_t21, padj < 0.05)
+resMix_t21 <- data.frame(resMix_t21)
+resMix_t21 <- merge(resMix_t21, taxa, by=0) #add taxa names
+t21Mix <- resMix_t21[(resMix_t21$log2FoldChange <= -1) | (resMix_t21$log2FoldChange >=1),]
+
+#to control if there are some false positives
+Mix21_da_tax <- t21Mix$Row.names
+setdiff(Mix21_da_tax, Mix_da_tax)
+#"ASV101" "ASV12"  "ASV146" "ASV223" "ASV231" "ASV248" "ASV267" "ASV30"  "ASV36"  "ASV58"
+
+psMix_t21 <- prune_taxa(taxa_names(ps_adult_rel) %in% Mix21_da_tax, ps_adult_rel)
+psMix_t21 <- psmelt(psMix_t21)
+DAMix_t21 <- ggplot(psMix_t21, aes(x = Timepoint, y = Abundance, col=Treatment))+geom_boxplot() + facet_wrap(~ OTU, scales="free") + scale_color_manual(values=treatment)
+
+#PAA
+
+resPAA_t21 <- results(dds_adult, contrast=list(c("Treatment_PAA_vs_Control", "Timepointt21.TreatmentPAA")), alpha=alpha)
+summary(resPAA_t21)
+resPAA_t21 <- subset(resPAA_t21, padj < 0.05)
+resPAA_t21 <- data.frame(resPAA_t21)
+resPAA_t21 <- merge(resPAA_t21, taxa, by=0) #add taxa names
+t21PAA <- resPAA_t21[(resPAA_t21$log2FoldChange <= -1) | (resPAA_t21$log2FoldChange >=1),]
+
+#to control if there are some false positives
+PAA21_da_tax <- t21PAA$Row.names
+setdiff(PAA21_da_tax, PAA_da_tax)
+#"ASV1"   "ASV116" "ASV144" "ASV146" "ASV159" "ASV17"  "ASV223" "ASV248" "ASV267" "ASV30"  "ASV36"  "ASV402" "ASV51"  "ASV84"
+
+psPAA_t21 <- prune_taxa(taxa_names(ps_adult_rel) %in% PAA21_da_tax, ps_adult_rel)
+psPAA_t21 <- psmelt(psPAA_t21)
+DAPAA_t21 <- ggplot(psPAA_t21, aes(x = Timepoint, y = Abundance, col=Treatment))+geom_boxplot() + facet_wrap(~ OTU, scales="free") + scale_color_manual(values=treatment)
+
+
+#for plotting, all diff. abundant asv of all three treatments must be combined into one data.frame with an additional column called treatment.
+#add treatment column
+Treatment <- "Florfenicol"
+Treatment <- rep(Treatment, 8)
+t21FF$Treatment <- Treatment
+
+Treatment <- "Mixture"
+Treatment <- rep(Treatment, 9)
+t21Mix$Treatment <- Treatment
+
+Treatment <- "PAA"
+Treatment <- rep(Treatment, 9)
+t21PAA$Treatment <- Treatment
+
+t21_effect <- rbind(t21FF, t21Mix, t21PAA)
+Timepoint <- "t21"
+Timepoint <- rep(Timepoint, 26)
+t21_effect$Timepoint <- Timepoint
+
+#modify label column -> combine family & genus
+cols <- c("Phylum", "Family", "Genus", "Row.names")
+t21_effect$Label <- apply(t21_effect[, cols], 1, paste, collapse=";")
+
+#repeat for t28
+
+resFF_t28 <- results(dds_adult, contrast=list(c("Treatment_Florfenicol_vs_Control", "Timepointt28.TreatmentFlorfenicol")), alpha=alpha)
+summary(resFF_t28)
+resFF_t28 <- subset(resFF_t28, padj < 0.05)
+resFF_t28 <- data.frame(resFF_t28)
+resFF_t28 <- merge(resFF_t28, taxa, by=0) #add taxa names
+t28FF <- resFF_t28[(resFF_t28$log2FoldChange <= -1) | (resFF_t28$log2FoldChange >=1),]
+
+#to control if there are some false positives
+FF28_da_tax <- t28FF$Row.names
+setdiff(FF28_da_tax, FF21_da_tax)
+#ASV3 missing 
+
+psFF_t28 <- prune_taxa(taxa_names(ps_adult_rel) %in% FF28_da_tax, ps_adult_rel)
+psFF_t28 <- psmelt(psFF_t28)
+DAFF_t28 <- ggplot(psFF_t28, aes(x = Timepoint, y = Abundance, col=Treatment))+geom_boxplot() + facet_wrap(~ OTU, scales="free") + scale_color_manual(values=treatment)
+
+#Mixture
+
+resMix_t28 <- results(dds_adult, contrast=list(c("Treatment_Mixture_vs_Control", "Timepointt28.TreatmentMixture")), alpha=alpha)
+summary(resMix_t28)
+resMix_t28 <- subset(resMix_t28, padj < 0.05)
+resMix_t28 <- data.frame(resMix_t28)
+resMix_t28 <- merge(resMix_t28, taxa, by=0) #add taxa names
+t28Mix <- resMix_t28[(resMix_t28$log2FoldChange <= -1) | (resMix_t28$log2FoldChange >=1),]
+
+#to control if there are some false positives
+Mix28_da_tax <- t28Mix$Row.names
+setdiff(Mix28_da_tax, Mix_da_tax)
+#"ASV101" "ASV267" "ASV402"
+
+psMix_t28 <- prune_taxa(taxa_names(ps_adult_rel) %in% Mix28_da_tax, ps_adult_rel)
+psMix_t28 <- psmelt(psMix_t28)
+DAMix_t28 <- ggplot(psMix_t28, aes(x = Timepoint, y = Abundance, col=Treatment))+geom_boxplot() + facet_wrap(~ OTU, scales="free") + scale_color_manual(values=treatment)
+
+#PAA
+
+resPAA_t28 <- results(dds_adult, contrast=list(c("Treatment_PAA_vs_Control", "Timepointt28.TreatmentPAA")), alpha=alpha)
+summary(resPAA_t28)
+resPAA_t28 <- subset(resPAA_t28, padj < 0.05)
+resPAA_t28 <- data.frame(resPAA_t28)
+resPAA_t28 <- merge(resPAA_t28, taxa, by=0) #add taxa names
+t28PAA <- resPAA_t28[(resPAA_t28$log2FoldChange <= -1) | (resPAA_t28$log2FoldChange >=1),]
+
+#to control if there are some false positives
+PAA28_da_tax <- t28PAA$Row.names
+setdiff(PAA28_da_tax, PAA_da_tax)
+#"ASV1"   "ASV116" "ASV144" "ASV248" "ASV402" "ASV84"
+
+psPAA_t28 <- prune_taxa(taxa_names(ps_adult_rel) %in% PAA28_da_tax, ps_adult_rel)
+psPAA_t28 <- psmelt(psPAA_t28)
+DAPAA_t28 <- ggplot(psPAA_t28, aes(x = Timepoint, y = Abundance, col=Treatment))+geom_boxplot() + facet_wrap(~ OTU, scales="free") + scale_color_manual(values=treatment)
+
+
+#for plotting, all diff. abundant asv of all three treatments must be combined into one data.frame with an additional column called treatment.
+#add treatment column
+Treatment <- "Florfenicol"
+Treatment <- rep(Treatment, 3)
+t28FF$Treatment <- Treatment
+
+Treatment <- "Mixture"
+Treatment <- rep(Treatment, 5)
+t28Mix$Treatment <- Treatment
+
+Treatment <- "PAA"
+Treatment <- rep(Treatment, 4)
+t28PAA$Treatment <- Treatment
+
+t28_effect <- rbind(t28FF, t28Mix, t28PAA)
+Timepoint <- "t28"
+Timepoint <- rep(Timepoint, 12)
+t28_effect$Timepoint <- Timepoint
+
+#modify label column -> combine family & genus
+cols <- c("Phylum", "Family", "Genus", "Row.names")
+t28_effect$Label <- apply(t28_effect[, cols], 1, paste, collapse=";")
+
+#save full dataframe as excel
+full_effect <- rbind(t10_effect, t14_effect, t21_effect, t28_effect)
+write.xlsx(full_effect, file="04_reports/DiffAbundance_adult.xlsx", colNames=TRUE)
+
+```
+
+#### Visualization of DESeq
+
+```{r deseq_viz, echo = T, eval = T, message = F, error = F, warning = F}
+
+#bar chart
+#remove unclassified on order level to reduce dimensions
+
+difftax_juv <- read.xlsx("04_reports/DiffAbundance_juvenile.xlsx")
+difftax_ad <- read.xlsx("04_reports/DiffAbundance_adult.xlsx")
+
+#exclude FP Taxa
+
+difftax_juv <- subset(difftax_juv, Note == "CP")
+difftax_ad <- subset(difftax_ad, Note == "CP")
+
+#set stringent filter of a log2foldchange of at least 1.5
+difftax_ad_filt <- difftax_ad %>% 
+  filter(log2FoldChange < - 2 | log2FoldChange > 2) %>%
+  filter(Order != "unclassified")
+
+difftax_juv_filt <- difftax_juv %>%
+   filter(log2FoldChange < - 2 | log2FoldChange > 2) %>%
+  filter(Order != "unclassified") %>%
+  filter(Family !="unclassified")
+
+
+
+#adjust Timepoint labeling
+difftax_juv_filt$Timepoint <- gsub("t10", "Treatment", difftax_juv_filt$Timepoint)
+difftax_juv_filt$Timepoint <- gsub("t14", "4d post-treatment", difftax_juv_filt$Timepoint)
+difftax_juv_filt$Timepoint <- gsub("t21", "11d post-treatment", difftax_juv_filt$Timepoint)
+difftax_juv_filt$Timepoint <- gsub("t28", "18d post-treatment", difftax_juv_filt$Timepoint)
+
+difftax_ad_filt$Timepoint <- gsub("t10", "Treatment", difftax_ad_filt$Timepoint)
+difftax_ad_filt$Timepoint <- gsub("t14", "4d post-treatment", difftax_ad_filt$Timepoint)
+difftax_ad_filt$Timepoint <- gsub("t21", "11d post-treatment", difftax_ad_filt$Timepoint)
+difftax_ad_filt$Timepoint <- gsub("t28", "18d post-treatment", difftax_ad_filt$Timepoint)
+
+#set order for labeling
+difftax_ad_filt$Timepoint <- factor(difftax_ad_filt$Timepoint, levels=c("t0", "Treatment", "4d post-treatment", "11d post-treatment", "18d post-treatment"))
+difftax_juv_filt$Timepoint <- factor(difftax_juv_filt$Timepoint, levels=c("t0", "Treatment", "4d post-treatment", "11d post-treatment", "18d post-treatment"))
+
+
+#adjust labeling, make shorter
+label_short <- c("Genus", "Species", "Row.names")
+difftax_juv_filt$Label_short <- apply(difftax_juv_filt[, label_short], 1, paste, collapse=" ")
+difftax_juv_filt <- difftax_juv_filt[order(difftax_juv_filt$Label_short), ]
+
+# Ändere die Reihenfolge der Faktorstufen von A nach Z
+difftax_juv_filt$Label_short <- factor(difftax_juv_filt$Label_short, levels = unique(difftax_juv_filt$Label_short))
+
+
+difftax_juv_bar <- ggplot(data = difftax_juv_filt, aes(x = factor(Label_short, levels = rev(unique(difftax_juv_filt$Label_short))), y = log2FoldChange, fill = Treatment)) +
+  geom_bar(position = "dodge", stat = "identity") +
+  scale_fill_manual(values = treatment) +
+  labs(x = "Taxa", y = "log2FoldChange") +
+    theme(
+    axis.text.y = element_text(face = "italic", family = "Arial", color = "black", size=16),
+    axis.text.x = element_text(family = "Arial", color = "black"), 
+    axis.title = element_text(family = "Arial", color = "black"),    
+    legend.text = element_text(family = "Arial", color = "black"),
+    legend.title = element_text(family = "Arial", color = "black", face="bold"),
+    strip.text = element_text(family = "Arial", color = "black", face="bold")     
+  ) +
+  guides(fill = guide_legend(title = "Treatment")) +
+  scale_y_continuous(limits = c(-30, 30), breaks = seq(-30, 30, by = 10)) +
+  coord_flip() +
+  facet_grid(~Timepoint) +
+  geom_vline(xintercept = seq(0.5, length(unique(difftax_juv_filt$Label)) - 0.5, by = 1), color = "gray", linetype = "dotted")
+
+difftax_juv_bar
+
+
+
+#adjust labeling, make shorter
+label_short <- c("Genus", "Species", "Row.names")
+difftax_ad_filt$Label_short <- apply(difftax_ad_filt[, label_short], 1, paste, collapse=" ")
+difftax_ad_filt <- difftax_ad_filt[order(difftax_ad_filt$Label_short), ]
+
+# Ändere die Reihenfolge der Faktorstufen von A nach Z
+difftax_ad_filt$Label_short <- factor(difftax_ad_filt$Label_short, levels = unique(difftax_ad_filt$Label_short))
+
+difftax_ad_bar <- ggplot(data=difftax_ad_filt, aes(x = factor(Label_short, levels = rev(unique(difftax_ad_filt$Label_short))), y=log2FoldChange, fill=Treatment))+
+  geom_bar(position="dodge", stat="identity", width=0.5)+
+  scale_fill_manual(values=treatment)+
+  labs(x="Taxa", y="log2FoldChange")+
+  #ggtitle("Differentially abundant taxa")+
+  #theme(plot.title=element_text("bold", hjust=0.5, size=12))+
+  theme(
+    axis.text.y = element_text(face = "italic", family = "Arial", color = "black", size=16),
+    axis.text.x = element_text(family = "Arial", color = "black"), 
+    axis.title = element_text(family = "Arial", color = "black"),    
+    legend.text = element_text(family = "Arial", color = "black"),
+    legend.title = element_text(family = "Arial", color = "black", face="bold"),
+    strip.text = element_text(family = "Arial", color = "black", face="bold")     
+  ) +
+  guides(fill=guide_legend(title="Treatment"))+
+  scale_y_continuous(limits = c(-30, 30), breaks = seq(-30, 30, by = 10))+
+  #scale_x_discrete(expand=c(0.5,0)) +
+  coord_flip() +
+  facet_grid(~Timepoint)+
+  geom_vline(xintercept = seq(0.5, length(unique(difftax_ad_filt$Label)) - 0.5, by = 1), color = "gray", linetype = "dotted")
+
+
+
+#panelplot for publication
+
+diff_panel <- ggarrange(difftax_juv_bar, difftax_ad_bar, labels="auto", ncol=2, nrow=1, common.legend = TRUE, legend="bottom")
+
+```
+
+### Microbial Co-Occurence Networks
+
+#### Network construction
+
+Aim of the analysis is to compare post-treatment network structure to controls
+
+```{r netcomi, eval=TRUE, error = F, warning = F, message = F, echo = T}
+
+#pairwise permanova showed that treatments did not differ from the control and each other at day 28 
+#all treatments will be combined into one object
+
+treat_netA <- subset_samples(ps_sub, !Treatment == "Control" & Age == "Adult" & Timepoint == "t28")
+treat_netJ <- subset_samples(ps_sub, !Treatment == "Control" & Age == "Juvenile" & Timepoint == "t28")
+ps_con_ad <- subset_samples(ps_sub, Treatment == "Control" & Age == "Adult")
+ps_con_juv <- subset_samples(ps_sub, Treatment == "Control" & Age == "Juvenile")
+
+#Post-Treatment Group Adult
+
+net_treat_ad <- netConstruct(data = treat_netA,
+                            filtTax = "numbSamp",
+                            filtTaxPar = list(numbSamp = 3),
+                            jointPrepro = FALSE,
+                            measure = "spieceasi",
+                            measurePar = list(pulsar.params = list(rep.num = 20), nlambda = 20),
+                            #zeroMethod = "none",
+                            #sparsMethod = "none",
+                            dissFunc = "signed",
+                            verbose = 2,
+                            seed = 713
+)
+
+#Post-Treatment Group Adult
+
+net_treat_juv <- netConstruct(data = treat_netJ,
+                             filtTax = "numbSamp",
+                             filtTaxPar = list(numbSamp = 3),
+                             jointPrepro = FALSE,
+                             measure = "spieceasi",
+                             measurePar = list(pulsar.params = list(rep.num = 20), nlambda = 20),
+                             #zeroMethod = "none",
+                             #sparsMethod = "none",
+                             dissFunc = "signed",
+                             verbose = 2,
+                             seed = 713
+)
+
+#Control group adult
+
+net_con_ad <- netConstruct(data = ps_con_ad,
+                             filtTax = "numbSamp",
+                             filtTaxPar = list(numbSamp = 3),
+                             jointPrepro = FALSE,
+                             measure = "spieceasi",
+                             measurePar = list(pulsar.params = list(rep.num = 20), nlambda = 20),
+                             #zeroMethod = "none",
+                             #sparsMethod = "none",
+                             dissFunc = "signed",
+                             verbose = 2,
+                             seed = 713
+)
+
+# Control group adult
+
+net_con_juv <- netConstruct(data = ps_con_juv,
+                           filtTax = "numbSamp",
+                           filtTaxPar = list(numbSamp = 3),
+                           jointPrepro = FALSE,
+                           measure = "spieceasi",
+                           measurePar = list(pulsar.params = list(rep.num = 20), nlambda = 20),
+                           #zeroMethod = "none",
+                           #sparsMethod = "none",
+                           dissFunc = "signed",
+                           verbose = 2,
+                           seed = 713
+)
+
+#netanalyze - adult
+
+Treat_ad_analyze <- netAnalyze(net_treat_ad,
+                                  weightDeg = FALSE, 
+                                  centrLCC = FALSE,
+                                  avDissIgnoreInf = FALSE,
+                                  sPathNorm = TRUE,
+                                  clustMethod = "cluster_fast_greedy",
+                                  hubPar = c("degree", "eigenvector"),
+                                  hubQuant = 0.9,
+                                  lnormFit = FALSE,
+                                  normDeg = TRUE,
+                                  normBetw = TRUE,
+                                  normClose = TRUE,
+                                  normEigen = TRUE)
+
+Treat_juv_analyze <- netAnalyze(net_treat_juv,
+                               weightDeg = FALSE, 
+                               centrLCC = FALSE,
+                               avDissIgnoreInf = FALSE,
+                               sPathNorm = TRUE,
+                               clustMethod = "cluster_fast_greedy",
+                               hubPar = c("degree", "eigenvector"),
+                               hubQuant = 0.9,
+                               lnormFit = FALSE,
+                               normDeg = TRUE,
+                               normBetw = TRUE,
+                               normClose = TRUE,
+                               normEigen = TRUE)
+
+#only drastically reduced pos. edge percentage and edge number - in both networks!
+
+Con_juv_analyze <- netAnalyze(net_con_juv,
+                                weightDeg = FALSE, 
+                                centrLCC = FALSE,
+                                avDissIgnoreInf = FALSE,
+                                sPathNorm = TRUE,
+                                clustMethod = "cluster_fast_greedy",
+                                hubPar = c("degree", "eigenvector"),
+                                hubQuant = 0.9,
+                                lnormFit = FALSE,
+                                normDeg = TRUE,
+                                normBetw = TRUE,
+                                normClose = TRUE,
+                                normEigen = TRUE)
+
+Con_ad_analyze <- netAnalyze(net_con_ad,
+                              weightDeg = FALSE, 
+                              centrLCC = FALSE,
+                              avDissIgnoreInf = FALSE,
+                              sPathNorm = TRUE,
+                              clustMethod = "cluster_fast_greedy",
+                              hubPar = c("degree", "eigenvector"),
+                              hubQuant = 0.9,
+                              lnormFit = FALSE,
+                              normDeg = TRUE,
+                              normBetw = TRUE,
+                              normClose = TRUE,
+                              normEigen = TRUE)
+
+#save as RDS file for microeco analysis
+
+saveRDS(net_treat_ad, file= "Network_postreat_adult.rds")
+saveRDS(net_treat_juv, file= "Network_postreat_juv.rds")
+saveRDS(Treat_ad_analyze, file= "NetworkAnalyze_postreat_adult.rds")
+saveRDS(Treat_juv_analyze, file= "NetworkAnalyze_postreat_juv.rds")
+saveRDS(net_con_ad, file= "Network_control_adult.rds")
+saveRDS(net_con_juv, file= "Network_control_juv.rds")
+saveRDS(Con_ad_analyze, file= "NetworkAnalzye_control_adult.rds")
+saveRDS(Con_juv_analyze, file= "NetworkAnalzye_control_juv.rds")
+
+## Identification of influential network hubs
+##script adjusted from PAME :) + based on this vignette: https://cran.r-project.org/web/packages/influential/vignettes/Vignettes.html
+
+library(influential)
+library(readr)
+library(igraph)
+
+#load networks from both control groups and both post-treatment groups (t28) as RDS back into the environment
+
+con_adult <- readRDS("Network_control_adult.rds")
+con_juv <- readRDS("Network_control_juv.rds")
+postreat_ad <- readRDS("Network_postreat_adult.rds")
+postreat_juv <- readRDS("Network_postreat_juv.rds")
+
+###  3.2 From an adjacency matrix
+#       adjacencies ( refers to the sparsified similarities for weighted networks)
+
+# Preparing the data
+# The adjacency matrix is part of the netConstructed object from NetCoMi
+#transform adjacency matrix into matrix object
+## An adjacency matrix is a mathematical representation of the relationships (or edges) between the nodes (microbes, in your case) in a co-occurrence network. It’s a square matrix where both the rows and columns represent the nodes (microbial taxa), and the values at each intersection indicate whether there is a relationship between two nodes.
+#Structure of the Adjacency Matrix: 
+#The rows represent one set of nodes (microbes).
+#The columns represent another set of nodes (microbes).
+#The values at the intersection (row i, column j) tell you whether there is an edge (connection) between node i and node j, and sometimes also the strength or type of the interaction.
+# weighted matrix (as from netwcomi) represent strength of correlation, positive or negative
+
+
+adjmat_con_ad  <- as.matrix(con_adult$adjaMat1)     # Access a column of df  
+adjmat_con_juv  <- as.matrix(con_juv$adjaMat1)
+adjmat_pt_ad  <- as.matrix(postreat_ad$adjaMat1)
+adjmat_pt_juv  <- as.matrix(postreat_juv$adjaMat1)
+
+### IfElse
+#   aparently the package INFLUENTIAL does not recognized a weighted adjecency matrix
+#  the output from netConstruct bz NetCoMi contain a weighted adjecency matrix if its input is an abundances count dataframa
+#  so we have to assume an input based on presence/absence of taxa, instead of abuncances
+#  to get this, all non-zero value will be consider 1
+# that is:
+# thansform the adjaMat1 from NetConstruct by NetCoMi in a unweighted adjecency matrix:
+adjmat_con_ad <- ifelse(adjmat_con_ad >0,1, 0)
+adjmat_con_juv <- ifelse(adjmat_con_juv >0,1, 0)
+adjmat_pt_ad <- ifelse(adjmat_pt_ad >0,1, 0)
+adjmat_pt_juv <- ifelse(adjmat_pt_juv >0,1, 0)
+
+# check structure if it is numeric
+
+## reconstruct the network graph
+
+# Reconstructing the graph
+
+con_ad_graph <- graph_from_adjacency_matrix(adjmat_con_ad)
+con_juv_graph <- graph_from_adjacency_matrix(adjmat_con_juv)
+pt_ad_graph <- graph_from_adjacency_matrix(adjmat_pt_ad)
+pt_juv_graph <- graph_from_adjacency_matrix(adjmat_pt_juv)
+
+class(con_ad_graph)
+class(con_juv_graph)
+class(pt_ad_graph)
+class(pt_juv_graph)
+# all "igraph"
+
+################################################################################
+### 4.1 Network vertices (nodes) are required in order to calculate their centrality measures. 
+#  Thus, before calculation of network centrality measures we need to obtain the name of 
+#  required network vertices. To this end, we use the V function, which is obtained from 
+#  the igraph package.
+
+# Extracting the vertices (nodes)
+con_ad_vertices <- V(con_ad_graph)
+con_juv_vertices <- V(con_juv_graph)
+pt_ad_vertices <- V(pt_ad_graph)
+pt_juv_vertices <- V(pt_juv_graph)
+
+################################################################################
+###  4.2 Degree centrality
+#   Degree centrality is the most commonly used local centrality measure 
+#   which could be calculated via the degree function obtained from the igraph package.
+
+## Calculating degree centrality
+con_ad_degree <- degree(con_ad_graph, v = con_ad_vertices, normalized = FALSE) 
+con_juv_degree <- degree(con_juv_graph, v = con_juv_vertices, normalized = FALSE)
+pt_ad_degree <- degree(pt_ad_graph, v = pt_ad_vertices, normalized = FALSE)
+pt_juv_degree <- degree(pt_juv_graph, v = pt_juv_vertices, normalized = FALSE)
+
+##note: those values are much higher than in netcomi? and higher than from those from pam?
+
+################################################################################
+###   4.3 Betweenness centrality
+#  Betweenness centrality, like degree centrality, is one of the most commonly used 
+#  centrality measures but is representative of the global centrality of a node.
+
+# Calculating betweenness centrality
+
+con_ad_betweenness <- betweenness(con_ad_graph, v = con_ad_vertices,    
+                                            directed = FALSE, normalized = FALSE)
+
+con_juv_betweenness <- betweenness(con_juv_graph, v = con_juv_vertices,    
+                                  directed = FALSE, normalized = FALSE)
+
+pt_ad_betweenness <- betweenness(pt_ad_graph, v = pt_ad_vertices,    
+                                   directed = FALSE, normalized = FALSE)
+
+pt_juv_betweenness <- betweenness(pt_juv_graph, v = pt_juv_vertices,    
+                                   directed = FALSE, normalized = FALSE)
+
+#again, very high. over > 200?
+
+################################################################################
+### 4.4 Neighborhood connectivity
+#    reflect the semi-local centrality of a node. 
+
+# Neighborhood Connectivity:
+# The neighborhood connectivity of a node (microbe) in a network refers to the average degree of all the nodes that are directly connected (neighbors) to that node. In other words, for any given node, it tells you how connected its neighbors are, on average.
+# The degree of a node is the number of connections (edges) it has to other nodes.
+# The neighborhood of a node includes all the nodes it is directly connected to (its first-degree neighbors).
+#Why Is This Useful?
+# Cluster Identification: High neighborhood connectivity often corresponds to nodes being part of dense clusters or modules. In microbial networks, these clusters might indicate microbial communities that interact strongly with each other (e.g., co-habiting or functionally related).
+# Keystone Identification: Nodes with low personal degree but high neighborhood connectivity could potentially indicate keystone species that connect tightly-knit microbial communities.
+
+neighrhood.con_ad <- neighborhood.connectivity(graph = con_ad_graph,    
+                                           vertices = con_ad_vertices,
+                                           mode = "all")
+
+head(neighrhood.con_ad)
+
+#ASV5578   ASV227  ASV5638   ASV234   ASV232   ASV706 
+#15.36364 21.59091 19.60000 20.10000 20.59091 21.30769
+
+neighrhood.con_juv <- neighborhood.connectivity(graph = con_juv_graph,    
+                                               vertices = con_juv_vertices,
+                                               mode = "all")
+
+neighrhood.pt_ad <- neighborhood.connectivity(graph = pt_ad_graph,    
+                                               vertices = pt_ad_vertices,
+                                               mode = "all")
+
+neighrhood.pt_juv <- neighborhood.connectivity(graph = pt_juv_graph,    
+                                               vertices = pt_juv_vertices,
+                                               mode = "all")
+
+head(neighrhood.pt_ad)
+#ASV357   ASV227   ASV232   ASV706   ASV104   ASV526 
+#13.00000 17.64706 16.37500 13.00000 16.42857 18.78947 
+
+#might be interesting to look into & also if this aligns with influential hubs or DA?
+
+# 4.5 H-index
+#   is a semi-local centrality measure that was 
+#   inspired from its application in assessing the impact 
+
+# Calculating H-index
+h.index_conad <- h_index(graph = con_ad_graph,    
+                   vertices = con_ad_vertices,
+                   mode = "all")
+
+h.index_conjuv <- h_index(graph = con_juv_graph,    
+                         vertices = con_juv_vertices,
+                         mode = "all")
+
+h.index_ptad <- h_index(graph = pt_ad_graph,    
+                         vertices = pt_ad_vertices,
+                         mode = "all")
+
+h.index_ptjuv <- h_index(graph = pt_juv_graph,    
+                         vertices = pt_juv_vertices,
+                         mode = "all")
+
+
+
+
+################################################################################
+### 4.6 Local H-index is a semi-local centrality measure and an improved 
+#     version of H-index centrality that leverages the H-index to the second 
+#     order neighbors of a node
+# Calculating Local H-index
+
+
+
+lh.index_conad <- lh_index(graph = con_ad_graph,    
+                         vertices = con_ad_vertices,
+                         mode = "all")
+
+lh.index_conjuv <- lh_index(graph = con_juv_graph,    
+                          vertices = con_juv_vertices,
+                          mode = "all")
+
+lh.index_ptad <- lh_index(graph = pt_ad_graph,    
+                        vertices = pt_ad_vertices,
+                        mode = "all")
+
+lh.index_ptjuv <- lh_index(graph = pt_juv_graph,    
+                         vertices = pt_juv_vertices,
+                         mode = "all")
+
+
+
+################################################################################
+###   6 Identification of the most influential network nodes
+
+##       6.1 Integrated Value of Influence (IVI) from centrality measures
+
+# Calculation of IVI
+# My.vertices.IVI <- ivi.from.indices(DC = MyData$DC,       
+#                                     CR = MyData$CR,
+#                                     NC = MyData$NC,
+#                                     LH_index = MyData$LH_index,
+#                                     BC = MyData$BC,
+#                                     CI = MyData$CI)
+##        6.2 Integrated Value of Influence (IVI) from a graph
+
+#  Calculation of IVI
+# My.vertices.IVI <- ivi(graph = MySpearman_graph, vertices = MySpearman_graph_vertices, 
+#                        weights = NULL, directed = FALSE, mode = "all",
+#                        loops = TRUE, d = 3, scale = "range")
+# 
+# 
+# 
+# head(My.vertices.IVI)
+# Asv616 Asv655 Asv704 Asv756 Asv679 Asv788 
+#    NaN    NaN    NaN    NaN    NaN    NaN 
+
+ivi_vertic_con_ad <- ivi(graph = con_ad_graph, vertices = con_ad_vertices, weights = NULL, directed = FALSE, mode = "all",
+                         loops = TRUE, d = 3, scale = "range")
+
+ivi_vertic_con_juv <- ivi(graph = con_juv_graph, vertices = con_juv_vertices, weights = NULL, directed = FALSE, mode = "all",
+                         loops = TRUE, d = 3, scale = "range")
+
+ivi_vertic_pt_ad <- ivi(graph = pt_ad_graph, vertices = pt_ad_vertices, weights = NULL, directed = FALSE, mode = "all",
+                         loops = TRUE, d = 3, scale = "range")
+
+ivi_vertic_pt_juv <- ivi(graph = pt_juv_graph, vertices = pt_juv_vertices, weights = NULL, directed = FALSE, mode = "all",
+                         loops = TRUE, d = 3, scale = "range")
+
+
+#################################
+### Calculating the Integrated Value of Influence (IVI) 
+# class(MySpearman_graph)
+# class(MySpiecEasi_graph)
+# class(MySPRING_graph)
+con_ad_IVI  <- ivi(con_ad_graph, directed = TRUE)
+con_juv_IVI <- ivi(con_juv_graph, directed = TRUE)
+pt_ad_IVI <- ivi(pt_ad_graph, directed = TRUE)
+pt_juv_IVI <- ivi(pt_juv_graph, directed = TRUE)
+
+
+#this seems to be the necessary object for the viz
+
+
+################################################################################
+##   6.3 Network visualization based on IVI values
+
+##########################
+#### based on Spearman network # Visualizing the graph based on IVI values
+# class(MySpearman_graph)
+# MySpearman_graph_IVI  <- ivi(MySpearman_graph, directed = TRUE)
+con_ad_IVI_Vis <- cent_network.vis(graph = con_ad_graph,
+                                             cent.metric = con_ad_IVI,
+                                             directed = FALSE,
+                                             show.labels = TRUE,
+                                             plot.title = "IVI-based Network from spieceasi construction",
+                                             legend.title = "IVI value",
+                                             layout = "kk",  # kk is default, In the case of highly crowded networks, the “grid” layout would be most appropriate.
+                                             dist.power = 3, 
+                                   #  1 is default, with higher values the nodes with less influence will be smaller
+)    
+
+con_juv_IVI_Vis <- cent_network.vis(graph = con_juv_graph,
+                                   cent.metric = con_juv_IVI,
+                                   directed = FALSE,
+                                   show.labels = TRUE,
+                                   plot.title = "IVI-based Network from spieceasi construction",
+                                   legend.title = "IVI value",
+                                   layout = "kk",  # kk is default, In the case of highly crowded networks, the “grid” layout would be most appropriate.
+                                   dist.power = 3  #  1 is default, with higher values the nodes with less influence will be smaller
+)
+
+pt_ad_IVI_Vis <- cent_network.vis(graph = pt_ad_graph,
+                                   cent.metric = pt_ad_IVI,
+                                   directed = FALSE,
+                                   show.labels = TRUE,
+                                   plot.title = "IVI-based Network from spieceasi construction",
+                                   legend.title = "IVI value",
+                                   layout = "kk",  # kk is default, In the case of highly crowded networks, the “grid” layout would be most appropriate.
+                                   dist.power = 3  #  1 is default, with higher values the nodes with less influence will be smaller
+)
+
+pt_juv_IVI_Vis <- cent_network.vis(graph = pt_juv_graph,
+                                   cent.metric = pt_juv_IVI,
+                                   directed = FALSE,
+                                   show.labels = TRUE,
+                                   plot.title = "IVI-based Network from spieceasi construction",
+                                   legend.title = "IVI value",
+                                   layout = "kk",  # kk is default, In the case of highly crowded networks, the “grid” layout would be most appropriate.
+                                   dist.power = 3  #  1 is default, with higher values the nodes with less influence will be smaller
+)
+
+###   Identification of the most important network spreaders
+
+###  7 Identification of the most important network spreaders
+#       Sometimes we seek to identify not necessarily the most influential nodes 
+#       but the nodes with most potential in spreading of information throughout the network.
+
+
+
+###  8 Identification of the most important network hubs
+# Calculation of Hubness score
+
+## Net By SpiecEasi
+Hubness_ZScore_con_ad <- hubness.score(graph = con_ad_graph,     
+                                               vertices = con_ad_vertices, 
+                                               directed = FALSE, mode = "all",
+                                               loops = TRUE, scale = "z-scale") %>% as.data.frame()
+
+Hubness_ZScore_con_juv <- hubness.score(graph = con_juv_graph,     
+                                       vertices = con_juv_vertices, 
+                                       directed = FALSE, mode = "all",
+                                       loops = TRUE, scale = "z-scale") %>% as.data.frame()
+
+Hubness_ZScore_pt_ad <- hubness.score(graph = pt_ad_graph,     
+                                       vertices = pt_ad_vertices, 
+                                       directed = FALSE, mode = "all",
+                                       loops = TRUE, scale = "z-scale") %>% as.data.frame()
+
+Hubness_ZScore_pt_juv <- hubness.score(graph = pt_juv_graph,     
+                                       vertices = pt_juv_vertices, 
+                                       directed = FALSE, mode = "all",
+                                       loops = TRUE, scale = "z-scale") %>% as.data.frame()
+
+
+#prepare xlsx file of all available outputs
+# includes: betweenness, degree, IVI, h-index, lh-index, hubness, neighrbood
+
+con_ad_measures <- data.frame("Degree" = con_ad_degree,
+                                 "Betweenness" = con_ad_betweenness,
+                                 "IVI" = con_ad_IVI,
+                                 "h-index" = h.index_conad,
+                                 "lh-index" = lh.index_conad,
+                                 "neighbour" = neighrhood.con_ad,
+                                 "hubness" = Hubness_ZScore_con_ad)
+con_ad_measures$Hubness <- con_ad_measures$.
+
+con_ad_measures <- merge(con_ad_measures, taxa, by=0)
+
+con_juv_measures <- data.frame("Degree" = con_juv_degree,
+                              "Betweenness" = con_juv_betweenness,
+                              "IVI" = con_juv_IVI,
+                              "h-index" = h.index_conjuv,
+                              "lh-index" = lh.index_conjuv,
+                              "neighbour" = neighrhood.con_juv,
+                              "hubness" = Hubness_ZScore_con_juv)
+con_juv_measures$Hubness <- con_juv_measures$.
+
+con_juv_measures <- merge(con_juv_measures, taxa, by=0)
+
+pt_ad_measures <- data.frame("Degree" = pt_ad_degree,
+                              "Betweenness" = pt_ad_betweenness,
+                              "IVI" = pt_ad_IVI,
+                              "h-index" = h.index_ptad,
+                              "lh-index" = lh.index_ptad,
+                              "neighbour" = neighrhood.pt_ad,
+                              "hubness" = Hubness_ZScore_pt_ad)
+pt_ad_measures$Hubness <- pt_ad_measures$.
+
+pt_ad_measures <- merge(pt_ad_measures, taxa, by=0)
+
+pt_juv_measures <- data.frame("Degree" = pt_juv_degree,
+                             "Betweenness" = pt_juv_betweenness,
+                             "IVI" = pt_juv_IVI,
+                             "h-index" = h.index_ptjuv,
+                             "lh-index" = lh.index_ptjuv,
+                             "neighbour" = neighrhood.pt_juv,
+                             "hubness" = Hubness_ZScore_pt_juv)
+pt_juv_measures$Hubness <- pt_juv_measures$.
+
+pt_juv_measures <- merge(pt_juv_measures, taxa, by=0)
+
+#prepare xlsx files
+
+write.xlsx(con_ad_measures, "Network_Measures_Control_ad.xlsx", rowNames = TRUE, colNames = TRUE)
+write.xlsx(con_juv_measures, "Network_Measures_Control_juv.xlsx", rowNames = TRUE, colNames = TRUE)
+write.xlsx(pt_ad_measures, "Network_Measures_pt_ad.xlsx", rowNames = TRUE, colNames = TRUE)
+write.xlsx(pt_juv_measures, "Network_Measures_pt_juv.xlsx", rowNames = TRUE, colNames = TRUE)
+
+
+###comparing networks using micro eco package
+
+### required libraries. 
+
+library(microeco)
+library(igraph)
+library(dplyr)
+
+##preparation is the same as above, you'll need the extracted adjacent matrices and igraphs
+
+# Calculate topological properties using igraph
+calculate_topo_properties <- function(graph) {
+  list(
+    clustering_coeff = transitivity(graph, type = "global"),
+    average_path_length = mean_distance(graph, directed = FALSE),
+    diameter = diameter(graph, directed = FALSE),
+    density = edge_density(graph)
+  )
+}
+
+topo_con_ad <- calculate_topo_properties(con_ad_graph)
+topo_con_juv <- calculate_topo_properties(con_juv_graph)
+topo_pt_ad <- calculate_topo_properties(pt_ad_graph)
+topo_pt_juv <- calculate_topo_properties(pt_juv_graph)
+
+#prepare joint dataframe and include aver. degree, av. betweenness - to be done
+
+#####################################################################
+# Calculate and compare robustness using the attack tolerance method
+calculate_robustness <- function(graph) {
+  attack_tolerance <- vertex_connectivity(graph)
+  return(attack_tolerance)
+}
+
+robust_con_ad <- calculate_robustness(con_ad_graph)
+robust_con_juv <- calculate_robustness(con_juv_graph)
+robust_pt_ad <- calculate_robustness(pt_ad_graph)
+robust_pt_juv <- calculate_robustness(pt_juv_graph)
+
+
+# Calculate and compare vulnerability of nodes
+vuln_1 <- vulnerability(con_ad_graph)
+vuln_2 <- node_vulnerability(con_juv_graph)
+vuln_3 <- node_vulnerability(pt_ad_graph)
+vuln_4 <- node_vulernability(pt_juv_graph)
+
+# Print vulnerability of nodes
+print("Node vulnerability for Condition 1:")
+print(vuln_1)
+print("Node vulnerability for Condition 2:")
+print(vuln_2)
+print("Node vulnerability for Condition 3:")
+print(vuln_3)
+
+
+# Combine all metrics into a summary table
+summary_table <- data.frame(
+  Group = c("Control Adult", "Control Juv", "Post-Treat Adult", "Post-Treat Juv"),
+  Clustering_Coefficient = c(topo_con_ad$clustering_coeff, topo_con_juv$clustering_coeff, topo_pt_ad$clustering_coeff, topo_pt_juv$clustering_coeff),
+  Average_Path_Length = c(topo_con_ad$average_path_length, topo_con_juv$average_path_length, topo_pt_ad$average_path_length, topo_pt_juv$average_path_length),
+  Diameter = c(topo_con_ad$diameter, topo_con_juv$diameter, topo_pt_ad$diameter, topo_pt_juv$diameter),
+  Robustness = c(robust_con_ad, robust_con_juv, robust_pt_ad, robust_pt_juv),
+  #Node_Vulnerability = c(mean(vuln_1$vulnerability), mean(vuln_2$vulnerability), mean(vuln_3$vulnerability), mean(vuln_4$vulnerability)),
+  Mean_Between = c(mean(con_ad_measures$Betweenness), mean(con_juv_measures$Betweenness), mean(pt_ad_measures$Betweenness), mean(pt_juv_measures$Betweenness)),
+  Mean_Degree = c(mean(con_ad_measures$Degree), mean(con_juv_measures$Degree), mean(pt_ad_measures$Degree), mean(pt_juv_measures$Degree))
+)
+
+# Print the summary table
+print(summary_table)
+
+write.xlsx(summary_table, "Topology_Summary_ConPT.xlsx", rowNames = TRUE, colNames = TRUE)
+
+
+```
+
+#### Visualization of network data
+
+```{r net_line, error = F, warning = F, echo = T, eval = T, message = F}
+
+#line plot to visualize changes in network metrics between controls & post-treatment networks
+
+#load table
+netprops <- read.xlsx(xlsxFile = "Paper/GutMicrobiome/Data/Netproperties_final.xlsx", sheet="cleantable_pt")
+
+
+netprops <- netprops %>% mutate_if(is.character, as.numeric) %>% mutate(across(where(is.numeric), ~ round(.,4)))
+names <- c("Control (Juv)", "Control (Ad)", "Post-Treatment (Juv)", "Post-Treatment (Ad)")
+netprops$Group <- names
+age <- c("juvenile", "adult", "juvenile", "adult")
+netprops$Age <- age
+
+#alternative test: plot line charts with age marked by shape
+ netprops$Group <- factor(netprops$Group, levels=c("Control (Juv)", "Control (Ad)", "Post-Treatment (Juv)", "Post-Treatment (Ad)"))
+
+line_degree <- ggplot(data=netprops, aes(x=Group, y=Average.Degree, color=Age, group = Age)) + 
+geom_line(linewidth=1.2) +
+  geom_point(size=3) +
+  scale_color_manual(values=age_col) +
+  ylim(24,40) +
+  theme_classic(base_size = 16) +
+    theme(
+    axis.text.y=element_text(family="Arial", color="black"),
+    axis.text.x = element_text(family="Arial", color="black", angle=45, vjust=1.0, hjust=1.0),
+    axis.title.x = element_blank())  +
+  ylab("Average Degree Centrality")
+
+line_between <- ggplot(data=netprops, aes(x=Group, y=Average.Betweenness, color=Age, group = Age)) + 
+geom_line(linewidth=1.2) +
+  geom_point(size=3) +
+  scale_color_manual(values=age_col) +
+  #ylim(24,40) +
+  theme_classic(base_size = 16) +
+    theme(
+    axis.text.y=element_text(family="Arial", color="black"),
+    axis.text.x = element_text(family="Arial", color="black", angle=45, vjust=1.0, hjust=1.0),
+    axis.title.x = element_blank())  +
+  ylab("Average Betweenness Centrality")
+
+line_edge <- ggplot(data=netprops, aes(x=Group, y=Edge.Number, color=Age, group = Age)) + 
+geom_line(linewidth=1.2) +
+  geom_point(size=3) +
+  scale_color_manual(values=age_col) +
+  #ylim(24,40) +
+  theme_classic(base_size = 16) +
+    theme(
+    axis.text.y=element_text(family="Arial", color="black"),
+    axis.text.x = element_blank(),
+    axis.title.x = element_blank())  +
+  ylab("Edge Number")
+
+line_perc <- ggplot(data=netprops, aes(x=Group, y=Pos_Edge, color=Age, group = Age)) + 
+geom_line(linewidth=1.2) +
+  geom_point(size=3) +
+  scale_color_manual(values=age_col) +
+  #ylim(24,40) +
+  theme_classic(base_size = 16) +
+    theme(
+    axis.text.y=element_text(family="Arial", color="black"),
+    axis.text.x = element_blank(),
+    axis.title.x = element_blank())  +
+  ylab("Positive Edge %")
+
+topo_panel <- ggarrange(line_perc, line_edge, line_degree, line_between, ncol=2, nrow=2, labels="auto", align="hv", font.label = list(size=16), common.legend=TRUE, legend="bottom")
+
+
+## heatmap of IVI hub ASVs
+
+#reload dataframe
+
+IVI_hubs <- read.xlsx("04_reports/IVI_Networkhubs_all.xlsx")
+names(IVI_hubs)[names(IVI_hubs) == 'ASV.ID'] <- 'OTU'
+rownames(IVI_hubs) <- IVI_hubs$OTU
+
+#melt ps object to bind abundance values & later use group for ggtile
+
+#load dataframe for hubs
+
+hubs_ConA <- read.xlsx("04_reports/Network_Measures_Control_ad.xlsx", sheet="IVI Hubs")
+colnames(hubs_ConA) <- hubs_ConA[1,]
+hubs_ConA <- hubs_ConA[-1,]
+vec_ConA <- hubs_ConA$`ASV ID`
+hubs_ConA$Group <- "Control adult"
+
+hubs_ConJ <- read.xlsx("04_reports/Network_Measures_Control_juv.xlsx", sheet="IVI Hubs")
+colnames(hubs_ConJ) <- hubs_ConJ[1,]
+hubs_ConJ <- hubs_ConJ[-1,]
+vec_ConJ <- hubs_ConJ$`ASV ID`
+hubs_ConJ$Group <- "Control juv"
+
+hubs_ptA <- read.xlsx("04_reports/Network_Measures_pt_ad.xlsx", sheet="IVI Hubs")
+colnames(hubs_ptA) <- hubs_ptA[1,]
+hubs_ptA <- hubs_ptA[-1,]
+vec_ptA <- hubs_ptA$`ASV ID`
+hubs_ptA$Groups <- "Post-Treatment ad"
+
+hubs_ptJ <- read.xlsx("04_reports/Network_Measures_pt_juv.xlsx", sheet="IVI hubs")
+colnames(hubs_ptJ) <- hubs_ptJ[1,]
+hubs_ptJ <- hubs_ptJ[-1,]
+vec_ptJ <- hubs_ptJ$`ASV ID`
+hubs_ptJ$Groups <- "Post-Treatment juv"
+
+
+#prepare this for all groups and then rbind
+#add labels including family, remove unclassified on order level
+
+ps_sub_rel <- transform_sample_counts(ps_CSS, function(x) 100*x/sum(x))
+ps_ConA <- subset_samples(ps_sub_rel, Age == "Adult" & Treatment == "Control")
+ps_ConA <- prune_taxa(taxa_names(ps_ConA) %in% vec_ConA, ps_ConA) %>% tax_glom("Genus") %>% psmelt()
+ps_ConA <- subset(ps_ConA, Order != "unclassified")
+ps_ConA$Group <- "Control ad"
+
+ps_sub_rel <- transform_sample_counts(ps_CSS, function(x) 100*x/sum(x))
+ps_ConJ <- subset_samples(ps_sub_rel, Age == "Juvenile" & Treatment == "Control")
+ps_ConJ <- prune_taxa(taxa_names(ps_ConJ) %in% vec_ConJ, ps_ConJ) %>% tax_glom("Genus") %>% psmelt()
+ps_ConJ <- subset(ps_ConJ, Order != "unclassified")
+ps_ConJ$Group <- "Control juv"
+
+ps_sub_rel <- transform_sample_counts(ps_CSS, function(x) 100*x/sum(x))
+ps_ptA <- subset_samples(ps_sub_rel, Age == "Adult" & !Treatment == "Control" & Timepoint == "t28")
+ps_ptA <- prune_taxa(taxa_names(ps_ptA) %in% vec_ptA, ps_ptA) %>% tax_glom("Genus") %>% psmelt()
+ps_ptA <- subset(ps_ptA, Order != "unclassified")
+ps_ptA$Group <- "Post-Treatment ad"
+
+ps_sub_rel <- transform_sample_counts(ps_CSS, function(x) 100*x/sum(x))
+ps_ptJ <- subset_samples(ps_sub_rel, Age == "Juvenile" & !Treatment == "Control" & Timepoint == "t28")
+ps_ptJ <- prune_taxa(taxa_names(ps_ptJ) %in% vec_ptJ, ps_ptJ) %>% tax_glom("Genus") %>% psmelt()
+ps_ptJ <- subset(ps_ptJ, Order != "unclassified")
+ps_ptJ$Group <- "Post-Treatment juv"
+
+#bind everything together
+
+hubs_all <- rbind(ps_ConA, ps_ConJ, ps_ptA, ps_ptJ)
+
+##prepare quick heatmap based on rel. abundance of the hubs with ggplot2
+
+heatmap_hubs <- ggplot(hubs_all, aes(x=Group, y=Genus, fill=Abundance)) + geom_tile() #looks like shit
+
+hubs_group <- hubs_all %>% 
+  group_by(Genus, Group) %>%
+  summarise(mean = mean(Abundance))
+
+hubs_group <- subset(hubs_group, !Genus == "unclassified")
+
+hubs_wide <- pivot_wider(hubs_group, names_from = "Genus",
+                          values_from = "mean")
+
+hubs_wide <- as.data.frame(hubs_wide)
+
+#change order - 
+hubs_wide$Group <- factor(hubs_wide$Group, levels=c("Control ad", "Control juv", "Post-Treatment ad", "Post-Treatment juv"))
+rownames(hubs_wide) <- hubs_wide$Group
+hubs_wide <- hubs_wide[order(hubs_wide$Group), ]
+
+hubs_wide[is.na(hubs_wide)] <- 0.0000
+
+hubs_wide <- hubs_wide[,-1]
+
+hubs_mat <- as.matrix(hubs_wide)
+hubs_mat <- t(hubs_mat)#correct order
+
+#sieht zusammengefasst besser aus
+library(circlize)
+
+col_fun3 = colorRamp2(seq(min(hubs_mat), max(hubs_mat), length = 3), c("darkblue", "#EEEEEE", "darkred"), space="RGB")
+
+#prepare annotation objects
+annotation_df <- data.frame(Genus = hubs_all$Genus, Phylum = hubs_all$Phylum)
+#remove duplicates
+duplicated(annotation_df)
+anno_df <- annotation_df[!duplicated(annotation_df), ]
+anno_df <- subset(anno_df, Genus != "unclassified")
+rownames(anno_df) <- anno_df$Genus
+
+
+#prepare in excel add core and DA column
+write.xlsx(anno_df, "04_reports/hubs_metadata.xlsx", colNames=TRUE, rowNames=TRUE)
+write.xlsx(anno_df, "04_reports/hubs_reduced_meta.xlsx", colNames=TRUE, rowNames=TRUE)
+
+#reload df and prepare big annotation object
+anno_df <- read.xlsx("04_reports/hubs_reduced_meta.xlsx")
+rownames(anno_df) <- anno_df$X1
+anno_df <- anno_df[,-1]
+
+
+# Create the annotation object - only phylum
+ha <- HeatmapAnnotation(Phylum = anno_df$Phylum, col = list(Phylum = c(
+  "Proteobacteria" = "#89BF71", 
+           "Bacteroidota" = "#95C7F6", 
+           "Firmicutes" = "#C19BD2", 
+           "Actinobacteriota" = "#5091CB",
+           "Myxococcota" = "#54863f", 
+           "Fusobacteriota" = "#E06A6A",
+            "Deinococcota" = "#ffd966",
+            "Patescibacteria" = "#e4a1c2",
+            "Desulfobacterota" = "#2ac8df",
+            "Campylobacterota" = "#a2c4c9")), which="row")
+
+#heatmap without any further annotation
+
+heatmap_pt <- Heatmap(hubs_mat, cluster_columns=FALSE, 
+                        col=col_fun3,
+                        #color_space="RGB",
+                        row_title = "Network Hubs",
+                        column_title = "Treatment Groups",
+                        column_title_side= "bottom",
+                        border=FALSE,
+                        cluster_rows=TRUE,
+                        #left_annotation = ha,
+                        #heatmap_legend_param = list(title = "Relative Abundance", labels = c("NA", "0.2", "0.4", "0.6", "0.8")),
+                        column_names_gp = grid::gpar(fontsize = 20),
+                        column_names_rot = 45,
+                        row_names_gp = grid::gpar(fontsize = 20),
+                        #cell_fun = cell_fun1,
+                        #width = unit(18, "cm"),
+                        #height = unit(47, "cm"),
+                        use_raster = TRUE)
+  
+
+```
+
+#### Relative changes of network positions of key responders
+
+```{r metrics, eval = T, echo = T, warning = F, message = F, error = F}
+
+##extract relevant centrality measures and prepare dataframe of relevant ASVs
+
+#### reload xlsx files 
+
+Con_ad_measures <- read.xlsx("04_reports/Network_Measures_Control_ad.xlsx")
+Con_juv_measures <- read.xlsx("04_reports/Network_Measures_Control_juv.xlsx")
+pt_ad_measures <- read.xlsx("04_reports/Network_Measures_pt_ad.xlsx")
+pt_juv_measures <- read.xlsx("04_reports/Network_Measures_pt_juv.xlsx")
+
+##add group label 
+
+Con_ad_measures$Group <- "Control"
+Con_juv_measures$Group <- "Control"
+pt_ad_measures$Group <- "Post_Treatment"
+pt_juv_measures$Group <- "Post_Treatment"
+Con_ad_measures$Age <- "Adult"
+Con_juv_measures$Age <- "Juvenile"
+pt_ad_measures$Age <- "Adult"
+pt_juv_measures$Age <- "Juvenile"
+
+## bind into one dataframe
+
+centrality_all <- rbind(Con_ad_measures, Con_juv_measures, pt_ad_measures, pt_juv_measures)
+
+## subset to only relevant ASVs - major key responders
+
+marker <- c("ASV5", "ASV3", "ASV2", "ASV19", "ASV39", "ASV402", "ASV225", "ASV80", "ASV17", "ASV27", "ASV47", "ASV58", "ASV116", "ASV90", "ASV23", "ASV449")
+
+subset_marker <- centrality_all[centrality_all$ASV.ID %in% marker, ] %>% mutate(Label = paste(ASV.ID, Genus, sep = ";"))
+
+
+## calculate percentage & ratio
+
+data_degree <- subset_marker %>%
+select(ASV.ID, Degree, Group, Age, Label) %>%
+  pivot_wider(names_from = Group, values_from = Degree, names_prefix = "Degree_", values_fill = 0) %>%
+  mutate(
+    # Berechnung des prozentualen Anstiegs/Abfalls
+    Perc_Change = ((Degree_Post_Treatment - Degree_Control) / Degree_Control) * 100,
+    Ratio = (Degree_Post_Treatment / Degree_Control)
+    
+  )
+
+data_betweenness <- subset_marker %>%
+select(ASV.ID, Betweenness, Group, Age, Label) %>%
+  pivot_wider(names_from = Group, values_from = Betweenness, names_prefix = "Between_", values_fill = 0) %>%
+  mutate(
+    # Berechnung des prozentualen Anstiegs/Abfalls
+    Perc_Change = ((Between_Post_Treatment - Between_Control) / Between_Control) * 100,
+    Ratio = (Between_Post_Treatment / Between_Control)
+    
+  )
+  
+  data_lh <- subset_marker %>%
+select(ASV.ID, lh.index, Group, Age, Label) %>%
+  pivot_wider(names_from = Group, values_from = lh.index, names_prefix = "lh_", values_fill = 0) %>%
+  mutate(
+    # Berechnung des prozentualen Anstiegs/Abfalls
+    Perc_Change = ((lh_Post_Treatment - lh_Control) / lh_Control) * 100,
+    Ratio = (lh_Post_Treatment / lh_Control)
+    
+  )
+  
+
+  
+degree_bar <- ggplot(data_degree, aes(x= factor(Label), y = Perc_Change, fill=Label)) +
+geom_bar(stat = "identity", position = "dodge") +
+facet_wrap(~ Age) +
+scale_fill_manual(values =  asv_col) +  
+  theme_classic(base_size=18) +
+  theme(
+    axis.text.x =  element_text(family = "Arial", color = "black", angle = 45, hjust = 1),
+    axis.text.y = element_text(family = "Arial", color = "black"),
+    axis.title.x = element_blank(),
+    axis.title.y = element_text(family = "Arial", color = "black"),
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold", size = 18, color = "black", family = "Arial", hjust = 0.5),
+    strip.text = element_text(family = "Arial", size = 18)  
+  ) +
+  labs(
+    title = "Percent Change in Degree Measure",
+    x = "ASV ID",
+    y = "Percent Change (%)",
+    fill = "ASV per Phylum"  
+  )
+  
+between_bar <- ggplot(data_betweenness, aes(x= factor(Label), y = Perc_Change, fill=Label)) +
+geom_bar(stat = "identity", position = "dodge") +
+facet_wrap(~ Age) +
+scale_fill_manual(values =  asv_col) +  
+  theme_classic(base_size=18) +
+  theme(
+    axis.text.x =  element_text(family = "Arial", color = "black", angle = 45, hjust = 1),  # X-Achsen-Beschriftungen
+    axis.text.y = element_text(family = "Arial", color = "black"),
+    axis.title.x = element_blank(),
+    axis.title.y = element_text(family = "Arial", color = "black"),
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold", size = 18, color = "black", family = "Arial", hjust = 0.5),
+    strip.text = element_text(family = "Arial", size = 18)  # Größe der Facettentitel
+  ) +
+  labs(
+    title = "Percent Change in Betweenness Measure",
+    x = "ASV ID",
+    y = "Percent Change (%)",
+    fill = "ASV per Phylum"  
+  )
+  
+ 
+lh_bar <- ggplot(data_lh, aes(x= factor(Label), y = Perc_Change, fill=Label)) +
+geom_bar(stat = "identity", position = "dodge") +
+facet_wrap(~ Age) +
+scale_fill_manual(values =  asv_col) +  
+  theme_classic(base_size=18) +
+  theme(
+    axis.text.x = element_text(family = "Arial", color = "black", angle = 45, hjust = 1),  
+    axis.text.y = element_text(family = "Arial", color = "black"),
+    axis.title.x = element_text(family = "Arial", color = "black"),
+    axis.title.y = element_text(family = "Arial", color = "black"),
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold", size = 18, color = "black", family = "Arial", hjust = 0.5),
+    strip.text = element_text(family = "Arial", size = 18)  
+  ) +
+  labs(
+    title = "Percent Change in leveraged h-index",
+    x = "ASV ID",
+    y = "Percent Change (%)",
+    fill = "ASV per Phylum"  
+  )
+  
+  centralities_panel <- ggarrange(degree_bar, between_bar, lh_bar, ncol=1, nrow=3, common.legend=TRUE, legend="bottom", align="h", labels="auto") # used for final publication
+ 
+
+
+```
